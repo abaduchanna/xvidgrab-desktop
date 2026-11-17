@@ -43,13 +43,25 @@ MAX_TCO_EXPANSIONS = 25
 # Pasting many links at once (a thread, a saved list) fetches each post
 # sequentially from the same unauthenticated syndication endpoint; firing
 # them back-to-back with no gap reliably trips its rate limit after only a
-# handful of requests, silently failing the rest. A small delay between
-# requests in a batch keeps a large batch well under that limit.
-BATCH_FETCH_DELAY = 0.4
+# handful of requests, silently failing the rest. A delay between requests
+# in a batch keeps it well under that limit; a short in-call retry (below)
+# absorbs one-off blips, and fetch_videos_batch's cooldown passes recover
+# anything still rate-limited after that.
+BATCH_FETCH_DELAY = 1.0
 # Transient 429/403 responses (the endpoint is momentarily rate-limiting)
 # are retried with backoff before being treated as a real failure.
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_BACKOFF_BASE = 1.5
+# fetch_videos_batch: links still rate-limited after their in-call retries
+# are collected and retried as additional passes once the whole list has
+# been through, after a cooldown that grows each pass - most unauthenticated
+# rate limits are a rolling window, so waiting it out recovers them.
+BATCH_MAX_PASSES = 5
+BATCH_COOLDOWN_START = 20.0
+BATCH_COOLDOWN_GROWTH = 1.6
+BATCH_COOLDOWN_MAX = 120.0
+BATCH_DELAY_GROWTH = 1.5
+BATCH_DELAY_MAX = 4.0
 
 # x.com/<user>/status/<id>  (accepts twitter.com, www., mobile., an optional
 # leading @ on the handle, and trailing /photo/N, /video/N, query strings and
@@ -65,6 +77,13 @@ _DIMS_RE = re.compile(r"/(\d{2,5})x(\d{2,5})(?:/|$|\?)")
 
 class XGrabError(Exception):
     """User-facing error with a friendly message."""
+
+
+class RateLimitError(XGrabError):
+    """A 429/403 from the syndication endpoint that survived the in-call
+    retries. Distinct from a hard failure (deleted post, bad link) so
+    fetch_videos_batch can retry it in a later cooldown pass instead of
+    giving up on it."""
 
 
 # --------------------------------------------------------------------------
@@ -230,7 +249,7 @@ def fetch_tweet(tweet_id: str) -> dict:
                 if attempt < RATE_LIMIT_RETRIES:
                     time.sleep(RATE_LIMIT_BACKOFF_BASE * (2 ** attempt))
                     continue
-                raise XGrabError(
+                raise RateLimitError(
                     "X is temporarily limiting requests. Wait a minute and try again."
                 ) from exc
             raise XGrabError(f"X returned HTTP {exc.code} for that post.") from exc
@@ -239,7 +258,7 @@ def fetch_tweet(tweet_id: str) -> dict:
                 "Could not reach X - check your internet connection and try again."
             ) from exc
     if raw is None:
-        raise XGrabError(
+        raise RateLimitError(
             "X is temporarily limiting requests. Wait a minute and try again."
         ) from last_exc
     try:
@@ -327,6 +346,81 @@ def fetch_videos(url: str) -> list[VideoItem]:
             "No videos found in that post - it may contain only photos."
         )
     return items
+
+
+def fetch_videos_batch(
+    urls: list[str],
+    on_item=None,
+    on_error=None,
+    stop_event=None,
+) -> tuple[int, int]:
+    """Fetch every link in *urls*, robust to a large batch tripping the
+    syndication endpoint's rate limit.
+
+    Each pass walks whatever is still pending, pacing requests with a delay
+    that grows the moment a rate limit is actually hit (most batches never
+    need it to grow at all). Links still rate-limited at the end of a pass
+    are retried in a further pass after a cooldown, which also grows each
+    time - unauthenticated rate limits are almost always a rolling window,
+    so waiting it out recovers links that a plain retry-on-the-spot can't.
+    A link that fails for a REAL reason (deleted, private, no videos) is
+    not retried - only rate-limited ones are.
+
+    on_item(items), if given, is called with each link's VideoItem list as
+    soon as it resolves. on_error(url, message) is called for every
+    failure (url is "" for a batch-level progress note, e.g. the cooldown
+    announcement). stop_event, if given and set, stops the batch early
+    (whatever hasn't been attempted yet is left out of the counts).
+
+    Returns (ok_count, fail_count) covering every url in *urls* exactly
+    once each.
+    """
+    pending = list(dict.fromkeys(urls))  # de-dup, keep order
+    ok_count = 0
+    hard_fail_count = 0
+    delay = BATCH_FETCH_DELAY
+    cooldown = BATCH_COOLDOWN_START
+
+    for pass_num in range(BATCH_MAX_PASSES):
+        if not pending:
+            break
+        rate_limited: list[str] = []
+        for i, u in enumerate(pending):
+            if stop_event is not None and stop_event.is_set():
+                return ok_count, hard_fail_count + len(pending) - i
+            if i > 0:
+                time.sleep(delay)
+            try:
+                items = fetch_videos(u)
+                if on_item:
+                    on_item(items)
+                ok_count += 1
+            except RateLimitError:
+                rate_limited.append(u)
+                delay = min(delay * BATCH_DELAY_GROWTH, BATCH_DELAY_MAX)
+            except XGrabError as exc:
+                hard_fail_count += 1
+                if on_error:
+                    on_error(u, str(exc))
+            except Exception as exc:  # defensive
+                hard_fail_count += 1
+                if on_error:
+                    on_error(u, f"Unexpected error: {exc}")
+        pending = rate_limited
+        if pending and pass_num < BATCH_MAX_PASSES - 1:
+            if stop_event is not None and stop_event.is_set():
+                return ok_count, hard_fail_count + len(pending)
+            if on_error:
+                on_error(
+                    "",
+                    f"{len(pending)} link(s) still rate-limited - "
+                    f"cooling down {int(cooldown)}s before retrying...",
+                )
+            time.sleep(cooldown)
+            cooldown = min(cooldown * BATCH_COOLDOWN_GROWTH, BATCH_COOLDOWN_MAX)
+
+    hard_fail_count += len(pending)  # exhausted all passes, still limited
+    return ok_count, hard_fail_count
 
 
 # --------------------------------------------------------------------------

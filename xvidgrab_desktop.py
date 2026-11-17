@@ -312,12 +312,14 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- fetch
     def start_fetch(self) -> None:
-        # clicking while a search collection runs stops it (keeps results)
-        if self.search_running:
+        # clicking while a fetch/search is running stops it (keeps results
+        # already found) - a large batch's cooldown-and-retry passes can
+        # take a while, so there has to be a way out.
+        if self.search_running or self.fetching:
             self.fetch_stop.set()
-            self.set_status("Stopping collection - please wait...", AMBER)
+            self.set_status("Stopping - please wait...", AMBER)
             return
-        if self.fetching or self.downloading:
+        if self.downloading:
             return
         text = self.url_entry.get().strip()
 
@@ -346,24 +348,15 @@ class App(tk.Tk):
             self._last_urls = urls
             self.msg_q.put(("fetchstart", "", f"Fetching {len(urls)} link"
                              f"{'s' if len(urls) > 1 else ''}..."))
-            ok_count = 0
-            fail_count = 0
-            for i, u in enumerate(urls):
-                if i > 0:
-                    # A large batch hammering X's syndication endpoint with
-                    # no gap trips its rate limit after a handful of
-                    # requests, silently failing the rest - space them out.
-                    time.sleep(core.BATCH_FETCH_DELAY)
-                try:
-                    items = core.fetch_videos(u)
-                    self.msg_q.put(("meta", u, items))
-                    ok_count += 1
-                except core.XGrabError as exc:
-                    self.msg_q.put(("fetcherr", u, str(exc)))
-                    fail_count += 1
-                except Exception as exc:  # defensive
-                    self.msg_q.put(("fetcherr", u, f"Unexpected error: {exc}"))
-                    fail_count += 1
+            self.fetch_stop.clear()
+            ok_count, fail_count = core.fetch_videos_batch(
+                urls,
+                on_item=lambda items: self.msg_q.put(("meta", "", items)),
+                on_error=lambda u, msg: self.msg_q.put(
+                    ("fetcherr", u, msg)
+                ),
+                stop_event=self.fetch_stop,
+            )
             self.msg_q.put(("fetchdone", "", (ok_count, fail_count, len(urls))))
 
         self.fetching = True
@@ -751,10 +744,15 @@ class App(tk.Tk):
                         )
                 elif kind == "fetcherr":
                     _, url, err = msg
-                    short = url if len(url) < 40 else url[:37] + "..."
-                    self.set_status(f"{short}: {err}", RED)
-                    if not self.items:
-                        messagebox.showwarning(core.APP_NAME, err, parent=self)
+                    if not url:
+                        # batch-level progress note (e.g. a cooldown
+                        # announcement), not a real per-link failure
+                        self.set_status(err, AMBER)
+                    else:
+                        short = url if len(url) < 40 else url[:37] + "..."
+                        self.set_status(f"{short}: {err}", RED)
+                        if not self.items:
+                            messagebox.showwarning(core.APP_NAME, err, parent=self)
                 elif kind == "fetchdone":
                     self.fetching = False
                     self.search_running = False

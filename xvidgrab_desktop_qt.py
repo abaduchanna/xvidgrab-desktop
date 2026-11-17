@@ -337,12 +337,14 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- fetch
     def start_fetch(self) -> None:
-        # clicking while a search collection runs stops it (keeps results)
-        if self.search_running:
+        # clicking while a fetch/search is running stops it (keeps results
+        # already found) - a large batch's cooldown-and-retry passes can
+        # take a while, so there has to be a way out.
+        if self.search_running or self.fetching:
             self.fetch_stop.set()
-            self.set_status("Stopping collection - please wait...", AMBER)
+            self.set_status("Stopping - please wait...", AMBER)
             return
-        if self.fetching or self.downloading:
+        if self.downloading:
             return
         text = self.url_edit.text().strip()
 
@@ -370,24 +372,22 @@ class MainWindow(QMainWindow):
             self.ctl.fetchStarted.emit(
                 f"Fetching {len(urls)} link{'s' if len(urls) > 1 else ''}..."
             )
-            ok_count = 0
-            fail_count = 0
-            for i, u in enumerate(urls):
-                if i > 0:
-                    # A large batch hammering X's syndication endpoint with
-                    # no gap trips its rate limit after a handful of
-                    # requests, silently failing the rest - space them out.
-                    time.sleep(core.BATCH_FETCH_DELAY)
-                try:
-                    items = core.fetch_videos(u)
-                    self.ctl.metaReady.emit(items)
-                    ok_count += 1
-                except core.XGrabError as exc:
-                    self.ctl.fetchError.emit(str(exc))
-                    fail_count += 1
-                except Exception as exc:  # defensive
-                    self.ctl.fetchError.emit(f"Unexpected error: {exc}")
-                    fail_count += 1
+            def on_error(u, msg):
+                if not u:
+                    # batch-level progress note (e.g. a cooldown
+                    # announcement), not a real per-link failure - route
+                    # through fetchStarted so it never pops a warning dialog
+                    self.ctl.fetchStarted.emit(msg)
+                else:
+                    self.ctl.fetchError.emit(f"{u}: {msg}")
+
+            self.fetch_stop.clear()
+            ok_count, fail_count = core.fetch_videos_batch(
+                urls,
+                on_item=lambda items: self.ctl.metaReady.emit(items),
+                on_error=on_error,
+                stop_event=self.fetch_stop,
+            )
             self._last_fetch_ok = ok_count
             self._last_fetch_fail = fail_count
             self._last_fetch_total = len(urls)
@@ -409,8 +409,9 @@ class MainWindow(QMainWindow):
         if search_url:
             self._begin_search(search_url)
             return
-        self.fetch_btn.setEnabled(False)
-        self.fetch_btn.setText("Fetching...")
+        self.fetch_stop.clear()
+        self.fetch_btn.setEnabled(True)
+        self.fetch_btn.setText("Stop")
         self.set_status("Fetching...", MUTED)
         threading.Thread(target=do_fetch, daemon=True).start()
 
