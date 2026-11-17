@@ -355,6 +355,27 @@ def parse_videos(data: dict, tweet_id: str) -> list[VideoItem]:
     return items
 
 
+def _dump_debug_json(tweet_id: str, data: dict) -> str | None:
+    """Save the raw syndication JSON for a "no videos found" post.
+
+    Only runs when XVIDGRAB_DEBUG is set in the environment - this is for
+    diagnosing a specific false "no videos" report without logging
+    anything by default. Returns the saved path, or None on any failure
+    (debug dumping must never break a real fetch).
+    """
+    if not os.environ.get("XVIDGRAB_DEBUG"):
+        return None
+    try:
+        debug_dir = os.path.join(os.path.expanduser("~"), ".xvidgrab-desktop-debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(debug_dir, f"{tweet_id}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return path
+    except Exception:
+        return None
+
+
 def fetch_videos(url: str) -> list[VideoItem]:
     """Fetch every video of one canonical post URL. Raises XGrabError."""
     m = _STATUS_RE.search(url or "")
@@ -364,9 +385,11 @@ def fetch_videos(url: str) -> list[VideoItem]:
     data = fetch_tweet(tweet_id)
     items = parse_videos(data, tweet_id)
     if not items:
-        raise XGrabError(
-            "No videos found in that post - it may contain only photos."
-        )
+        dumped = _dump_debug_json(tweet_id, data)
+        msg = "No videos found in that post - it may contain only photos."
+        if dumped:
+            msg += f"\n(debug JSON saved: {dumped})"
+        raise XGrabError(msg)
     return items
 
 
