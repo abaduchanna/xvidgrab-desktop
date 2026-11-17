@@ -15,6 +15,10 @@ page** with live thumbnails and the best quality available (480p, 720p, 1080p,
 4K — whatever the post has). Tick the ones you want — or hit **Select all** —
 and download them in one go.
 
+Paste a **search link** (`x.com/search?q=...`) instead and the app opens the
+results in Edge, **auto-scrolls the page to the very end** and puts **every
+video on the page** into the download list — thumbnails, qualities, all of it.
+
 Two polished interfaces are included, both with **list view and grid view**:
 
 | Build | GUI toolkit | File |
@@ -38,6 +42,11 @@ same public embed data source X serves to every website on the internet.
 
 ## Features
 
+- **Search-page fetching** — paste a search link like
+  `https://x.com/search?q=backshots&src=recent_search_click` and the app
+  opens the results in Edge, scrolls to the very end of the feed and lists
+  **every video on the page** for download (press **Stop** any time to use
+  what has been collected so far)
 - **Paste a link, get everything** — every video of the post appears with its
   thumbnail, duration and available qualities (multi-video posts show all of
   them)
@@ -57,6 +66,28 @@ same public embed data source X serves to every website on the internet.
 - **Two GUIs, one engine** — a light Tkinter build and a Qt (PySide6) build,
   sharing the same `xgrab_core.py` engine
 
+## How search-page fetching works
+
+X has no public search API and search results need a logged-in session, so
+the desktop app loads the page in a real **Microsoft Edge** window
+(selenium):
+
+1. The collector opens your search URL in Edge using its own persistent
+   profile (`XVidGrab-EdgeProfile` in your home folder). **Log in to X once
+   when it asks** — every later run reuses that session automatically.
+2. It auto-scrolls the feed to the very end — the same proven collector the
+   XVidGrab extension's *Fetch All* uses (feed end = page height and collected
+   count stable, 12-minute safety cap).
+3. Every video card it passes is harvested — including tiles that only expose
+   a `/status/<id>/video/1` link (search videos do not autoplay, so this is
+   the only reliable shape on unplayed cards).
+4. Each collected post is resolved through the public embed data source, so
+   every video lands in the normal list with thumbnail, duration and quality
+   options — ready to download.
+
+Requirements: Microsoft Edge installed (pre-installed on Windows 10/11). The
+EXE downloads the matching Edge driver automatically on first use.
+
 ## Requirements
 
 - Windows 10/11 for the ready-made EXEs (download from [Releases](../../releases))
@@ -74,10 +105,12 @@ same public embed data source X serves to every website on the internet.
        python xvidgrab_desktop.py        (Tkinter build)
 
 2. Copy an X post link — for example
-   `https://x.com/SpaceX/status/2122355344576037338` — and paste it into the
-   top bar (several links in one paste are fine).
+   `https://x.com/SpaceX/status/2122355344576037338` — or a **search link**
+   like `https://x.com/search?q=cats&f=live` — and paste it into the
+   top bar (several post links in one paste are fine).
 3. Press **Fetch videos**. Every video on the page shows up as a thumbnail
-   card.
+   card. For search links, Edge opens and the app scrolls the page to the end
+   first (press **Stop** any time to use what has been collected so far).
 4. Switch between **Grid** and **List** views any time.
 5. Tick the videos you want — or press **Select all**.
 6. Pick a quality (default: **Best available**) and a folder if you like.
@@ -88,11 +121,21 @@ same public embed data source X serves to every website on the internet.
 
 - Works with **public** posts. Deleted, private or age-gated posts can't be
   fetched (you'll get a clear error message instead).
-- Profile/timeline pages are not supported — paste the individual post links.
+- Search pages need an X login (X requires it); the app waits while you log
+  in inside the Edge window, once.
 - Animated GIFs are downloaded as looping MP4 videos (that is how X serves
   them).
 - If X changes its public embed data, the engine may need an update — pull
   requests welcome.
+
+## Bundled browser extension
+
+This repository also carries the **XVidGrab browser extension** (the
+one-click X video downloader for Chromium & Firefox) under
+[`extension/`](extension/) — including the v1.2.0 search-page fix and the
+Fetch All scroll-to-end collector. See
+[extension/README.md](extension/README.md) for its documentation, or install
+it from the [xvidgrab releases](https://github.com/abaduchanna/xvidgrab/releases).
 
 ## Building the EXE (optional)
 

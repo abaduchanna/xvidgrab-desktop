@@ -25,6 +25,7 @@ import tkinter as tk
 from PIL import Image, ImageTk
 
 import xgrab_core as core
+import xgrab_search as xsearch
 
 # 3SVerse brand palette (same tokens as License Studio / WiFi Transfer)
 BG = "#07060b"
@@ -97,6 +98,8 @@ class App(tk.Tk):
         self._last_grid_cols = 0
         self.msg_q: "queue.Queue[tuple]" = queue.Queue()
         self.cancel_event = threading.Event()
+        self.fetch_stop = threading.Event()
+        self.search_running = False
         self.fetching = False
         self.downloading = False
         self._dl_done = 0
@@ -127,7 +130,7 @@ class App(tk.Tk):
         ).pack(anchor=W)
         tk.Label(
             hleft,
-            text="Paste an X (Twitter) post link - grab every video on the page",
+            text="Paste an X post link - or a search link (x.com/search?q=...) to grab every video on the page",
             bg=BG, fg=MUTED, font=("Segoe UI", 9),
         ).pack(anchor=W)
         tk.Label(
@@ -308,11 +311,26 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- fetch
     def start_fetch(self) -> None:
+        # clicking while a search collection runs stops it (keeps results)
+        if self.search_running:
+            self.fetch_stop.set()
+            self.set_status("Stopping collection - please wait...", AMBER)
+            return
         if self.fetching or self.downloading:
             return
         text = self.url_entry.get().strip()
 
+        search_url = xsearch.is_search_url(text)
+        if not search_url and core._TCO_RE.search(text):
+            try:
+                search_url = xsearch.is_search_url(core.expand_tco_links(text))
+            except Exception:
+                search_url = None
+
         def do_fetch():
+            if search_url:
+                self._do_search_fetch(search_url)
+                return
             urls = core.parse_status_urls(text)
             if not urls and core._TCO_RE.search(text):
                 try:
@@ -320,8 +338,9 @@ class App(tk.Tk):
                 except Exception:
                     urls = []
             if not urls:
-                self.msg_q.put(("fetcherr", "", "No X post link found in the input.\n"
-                                "Paste a link like x.com/user/status/123..."))
+                self.msg_q.put(("fetcherr", "", "No X post link or search link found in the input.\n"
+                                "Paste a link like x.com/user/status/123...\n"
+                                "or a search page like x.com/search?q=videos"))
                 return
             self._last_urls = urls
             self.msg_q.put(("fetchstart", "", f"Fetching {len(urls)} link"
@@ -347,9 +366,34 @@ class App(tk.Tk):
         self._clear_results()
         self._update_counter()
         self.progress.pack_forget()
-        self.fetch_btn.configure(state="disabled", text="Fetching...")
-        self.set_status("Fetching...", MUTED)
+        if search_url:
+            self.search_running = True
+            self.fetch_stop.clear()
+            # keep the button alive as a Stop control during collection
+            self.fetch_btn.configure(state="normal", text="Stop")
+            self.set_status("Collecting every video from the search page...", MUTED)
+        else:
+            self.fetch_btn.configure(state="disabled", text="Fetching...")
+            self.set_status("Fetching...", MUTED)
         threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _do_search_fetch(self, search_url: str) -> None:
+        """Worker: scroll the search page in Edge and resolve every video."""
+        try:
+            collector = xsearch.SearchCollector(
+                search_url,
+                progress=lambda msg: self.msg_q.put(("fetchstart", "", msg)),
+                on_items=lambda chunk: self.msg_q.put(("meta", search_url, chunk)),
+                stop_event=self.fetch_stop,
+            )
+            collector.collect()
+        except core.XGrabError as exc:
+            self.msg_q.put(("fetcherr", search_url, str(exc)))
+        except Exception as exc:  # defensive
+            self.msg_q.put(("fetcherr", search_url, f"Unexpected error: {exc}"))
+        finally:
+            self.search_running = False
+            self.msg_q.put(("fetchdone", "", ""))
 
     # ------------------------------------------------------------ results
     def _clear_results(self):
@@ -672,6 +716,7 @@ class App(tk.Tk):
                         messagebox.showwarning(core.APP_NAME, err, parent=self)
                 elif kind == "fetchdone":
                     self.fetching = False
+                    self.search_running = False
                     self.fetch_btn.configure(state="normal", text="Fetch videos")
                     if self.items:
                         self._clear_results()

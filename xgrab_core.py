@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 APP_NAME = "XVidGrab Desktop"
 
 USER_AGENT = (

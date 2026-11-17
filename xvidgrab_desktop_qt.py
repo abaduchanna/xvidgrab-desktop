@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 import xgrab_core as core
+import xgrab_search as xsearch
 
 BG = "#07060b"
 SURFACE = "#0d0c14"
@@ -170,6 +171,8 @@ class MainWindow(QMainWindow):
 
         self.ctl = Controller()
         self.cancel_event = threading.Event()
+        self.fetch_stop = threading.Event()
+        self.search_running = False
         self.fetching = False
         self.downloading = False
         self._dl_done = self._dl_ok = self._dl_fail = self._dl_total = 0
@@ -205,7 +208,7 @@ class MainWindow(QMainWindow):
         f.setPointSize(13)
         f.setBold(True)
         name.setFont(f)
-        sub = QLabel("Paste an X (Twitter) post link - grab every video on the page")
+        sub = QLabel("Paste an X post link - or a search link (x.com/search?q=...) to grab every video on the page")
         sub.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
         hleft.addWidget(name)
         hleft.addWidget(sub)
@@ -220,7 +223,8 @@ class MainWindow(QMainWindow):
         urlrow = QHBoxLayout()
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText(
-            "https://x.com/user/status/123...   (several links in one paste are fine)"
+            "https://x.com/user/status/123... or https://x.com/search?q=..."
+            "   (several post links in one paste are fine)"
         )
         self.url_edit.returnPressed.connect(self.start_fetch)
         urlrow.addWidget(self.url_edit, 1)
@@ -331,11 +335,26 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- fetch
     def start_fetch(self) -> None:
+        # clicking while a search collection runs stops it (keeps results)
+        if self.search_running:
+            self.fetch_stop.set()
+            self.set_status("Stopping collection - please wait...", AMBER)
+            return
         if self.fetching or self.downloading:
             return
         text = self.url_edit.text().strip()
 
+        search_url = xsearch.is_search_url(text)
+        if not search_url and core._TCO_RE.search(text):
+            try:
+                search_url = xsearch.is_search_url(core.expand_tco_links(text))
+            except Exception:
+                search_url = None
+
         def do_fetch():
+            if search_url:
+                self._do_search_fetch(search_url)
+                return
             urls = core.parse_status_urls(text)
             if not urls and core._TCO_RE.search(text):
                 try:
@@ -344,8 +363,9 @@ class MainWindow(QMainWindow):
                     urls = []
             if not urls:
                 self.ctl.fetchError.emit(
-                    "No X post link found in the input.\n"
-                    "Paste a link like x.com/user/status/123..."
+                    "No X post link or search link found in the input.\n"
+                    "Paste a link like x.com/user/status/123...\n"
+                    "or a search page like x.com/search?q=videos"
                 )
                 return
             self.ctl.fetchStarted.emit(
@@ -370,10 +390,39 @@ class MainWindow(QMainWindow):
         self.status_state = {}
         self._clear_results()
         self._update_counter()
-        self.fetch_btn.setEnabled(False)
-        self.fetch_btn.setText("Fetching...")
-        self.set_status("Fetching...", MUTED)
+        if search_url:
+            self.search_running = True
+            self.fetch_stop.clear()
+            # keep the button alive as a Stop control during collection
+            self.fetch_btn.setEnabled(True)
+            self.fetch_btn.setText("Stop")
+        else:
+            self.fetch_btn.setEnabled(False)
+            self.fetch_btn.setText("Fetching...")
+        self.set_status(
+            "Collecting every video from the search page..."
+            if search_url else "Fetching...",
+            MUTED,
+        )
         threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _do_search_fetch(self, search_url: str) -> None:
+        """Worker: scroll the search page in Edge and resolve every video."""
+        try:
+            collector = xsearch.SearchCollector(
+                search_url,
+                progress=lambda msg: self.ctl.fetchStarted.emit(msg),
+                on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
+                stop_event=self.fetch_stop,
+            )
+            collector.collect()
+        except core.XGrabError as exc:
+            self.ctl.fetchError.emit(str(exc))
+        except Exception as exc:  # defensive
+            self.ctl.fetchError.emit(f"Unexpected error: {exc}")
+        finally:
+            self.search_running = False
+            self.ctl.fetchDone.emit()
 
     def _on_fetch_started(self, text: str) -> None:
         self.set_status(text, MUTED)
@@ -390,6 +439,7 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_done(self) -> None:
         self.fetching = False
+        self.search_running = False
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Fetch videos")
         if self.items:
