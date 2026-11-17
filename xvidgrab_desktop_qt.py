@@ -141,7 +141,7 @@ class Controller(QObject):
     fetchStarted = Signal(str)                    # status text
     metaReady = Signal(list)                      # VideoItem list
     fetchError = Signal(str)                      # friendly error
-    fetchDone = Signal(int, int, int)             # ok_links, failed_links, total_links
+    fetchDone = Signal()
     thumbReady = Signal(tuple, bytes)             # key, image bytes
     itemProgress = Signal(tuple, int, object)     # key, downloaded, total
     itemDone = Signal(tuple, str)                 # key, path
@@ -388,7 +388,10 @@ class MainWindow(QMainWindow):
                 except Exception as exc:  # defensive
                     self.ctl.fetchError.emit(f"Unexpected error: {exc}")
                     fail_count += 1
-            self.ctl.fetchDone.emit(ok_count, fail_count, len(urls))
+            self._last_fetch_ok = ok_count
+            self._last_fetch_fail = fail_count
+            self._last_fetch_total = len(urls)
+            self.ctl.fetchDone.emit()
 
         self.fetching = True
         # reset previous results
@@ -396,7 +399,11 @@ class MainWindow(QMainWindow):
         self.item_map = {}
         self.cards = {}
         self.pixmaps = {}
+        self._thumb_requested = set()
         self.status_state = {}
+        self._last_fetch_ok = 0
+        self._last_fetch_fail = 0
+        self._last_fetch_total = 0
         self._clear_results()
         self._update_counter()
         if search_url:
@@ -500,37 +507,58 @@ class MainWindow(QMainWindow):
         self.set_status(text, MUTED)
 
     def _on_meta(self, items: list) -> None:
+        if not items:
+            return
         for it in items:
             self.items.append(it)
             self.item_map[it.key] = it
+        # Show results as each link resolves instead of waiting for the
+        # whole batch (which can be minutes for a large paste) - the user
+        # sees videos land live rather than a long silent wait.
+        self._refresh_results_ui()
+        self.set_status(
+            f"{len(self.items)} video{'s' if len(self.items) != 1 else ''} "
+            f"found so far - still fetching...",
+            MUTED,
+        )
 
     def _on_fetch_error(self, err: str) -> None:
         self.set_status(err, RED)
         if not self.items:
             QMessageBox.warning(self, core.APP_NAME, err)
 
-    def _on_fetch_done(self, ok_links: int, fail_links: int, total_links: int) -> None:
+    def _refresh_results_ui(self) -> None:
+        self._clear_results()
+        self.render_cards()
+        self._start_thumbs()
+        opts = ["Best available"] + core.quality_options(self.items)
+        prev = self.quality_box.currentText()
+        self.quality_box.clear()
+        self.quality_box.addItems(opts)
+        if prev in opts:
+            self.quality_box.setCurrentText(prev)
+        self._update_counter()
+
+    def _on_fetch_done(self) -> None:
         self.fetching = False
         self.search_running = False
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Fetch videos")
         if self.items:
-            self._clear_results()
-            self.render_cards()
-            self._start_thumbs()
-            opts = ["Best available"] + core.quality_options(self.items)
-            prev = self.quality_box.currentText()
-            self.quality_box.clear()
-            self.quality_box.addItems(opts)
-            if prev in opts:
-                self.quality_box.setCurrentText(prev)
-            self._update_counter()
+            self._refresh_results_ui()
+            total_links = getattr(self, "_last_fetch_total", 0)
+            fail_links = getattr(self, "_last_fetch_fail", 0)
+            ok_links = getattr(self, "_last_fetch_ok", 0)
             summary = (
-                f"{len(self.items)} video{'s' if len(self.items) != 1 else ''} "
-                f"found from {ok_links}/{total_links} link{'s' if total_links != 1 else ''}"
+                f"{len(self.items)} video{'s' if len(self.items) != 1 else ''} found"
             )
-            if fail_links:
-                summary += f" ({fail_links} link{'s' if fail_links != 1 else ''} failed - see above)"
+            if total_links:
+                summary += (
+                    f" from {ok_links}/{total_links} "
+                    f"link{'s' if total_links != 1 else ''}"
+                )
+                if fail_links:
+                    summary += f" ({fail_links} link{'s' if fail_links != 1 else ''} failed - see above)"
             summary += " - pick and press Download selected"
             self.set_status(summary, GREEN if not fail_links else AMBER)
 
@@ -689,6 +717,10 @@ class MainWindow(QMainWindow):
         return row
 
     def _start_thumbs(self) -> None:
+        # Called once per link now (progressive results), not just once for
+        # the whole batch - only submit items that haven't been requested
+        # yet, or a 256-link batch would resubmit the same early items'
+        # thumbnail jobs hundreds of times.
         def job(item: core.VideoItem):
             try:
                 data = core.fetch_thumbnail_bytes(item, "small")
@@ -696,8 +728,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # placeholder stays
 
+        pending = [it for it in self.items if it.key not in self._thumb_requested]
+        if not pending:
+            return
         pool = ThreadPoolExecutor(max_workers=THUMB_POOL)
-        for it in self.items:
+        for it in pending:
+            self._thumb_requested.add(it.key)
             pool.submit(job, it)
         pool.shutdown(wait=False)
 

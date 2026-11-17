@@ -372,6 +372,7 @@ class App(tk.Tk):
         self.item_map = {}
         self.sel_vars = {}
         self.photos = {}
+        self._thumb_requested = set()
         self.status_state = {}
         self._last_grid_cols = 0
         self._clear_results()
@@ -412,6 +413,16 @@ class App(tk.Tk):
             w.destroy()
         self.status_labels.clear()
         self.thumb_label.clear()
+
+    def _refresh_results_ui(self):
+        self._clear_results()
+        self.render_cards()
+        self._start_thumbs()
+        opts = ["Best available"] + core.quality_options(self.items)
+        prev = self.quality_box.get()
+        self.quality_box.configure(values=opts)
+        self.quality_box.set(prev if prev in opts else "Best available")
+        self._update_counter()
 
     def set_view(self, view: str):
         self.view = view
@@ -577,6 +588,10 @@ class App(tk.Tk):
 
     # ------------------------------------------------------- thumb worker
     def _start_thumbs(self):
+        # Called once per link now (progressive results), not just once for
+        # the whole batch - only submit items that haven't been requested
+        # yet, or a large batch would resubmit the same early items'
+        # thumbnail jobs over and over.
         def job(item: core.VideoItem):
             try:
                 data = core.fetch_thumbnail_bytes(item, "small")
@@ -584,8 +599,12 @@ class App(tk.Tk):
             except Exception:
                 pass  # placeholder stays
 
+        pending = [it for it in self.items if it.key not in self._thumb_requested]
+        if not pending:
+            return
         pool = ThreadPoolExecutor(max_workers=THUMB_POOL)
-        for it in self.items:
+        for it in pending:
+            self._thumb_requested.add(it.key)
             pool.submit(job, it)
         pool.shutdown(wait=False)
 
@@ -715,10 +734,21 @@ class App(tk.Tk):
                     self.set_status(msg[2], MUTED)
                 elif kind == "meta":
                     _, _url, items = msg
-                    for it in items:
-                        self.items.append(it)
-                        self.item_map[it.key] = it
-                        self.sel_vars[it.key] = tk.IntVar(value=1)
+                    if items:
+                        for it in items:
+                            self.items.append(it)
+                            self.item_map[it.key] = it
+                            self.sel_vars[it.key] = tk.IntVar(value=1)
+                        # Show results as each link resolves instead of
+                        # waiting for the whole batch (which can be minutes
+                        # for a large paste) - videos land live.
+                        self._refresh_results_ui()
+                        self.set_status(
+                            f"{len(self.items)} video"
+                            f"{'s' if len(self.items) != 1 else ''} found so far - "
+                            f"still fetching...",
+                            MUTED,
+                        )
                 elif kind == "fetcherr":
                     _, url, err = msg
                     short = url if len(url) < 40 else url[:37] + "..."
@@ -731,27 +761,21 @@ class App(tk.Tk):
                     self.fetch_btn.configure(state="normal", text="Fetch videos")
                     ok_links, fail_links, total_links = msg[2] if msg[2] else (0, 0, 0)
                     if self.items:
-                        self._clear_results()
-                        self.render_cards()
-                        self._start_thumbs()
-                        opts = ["Best available"] + core.quality_options(self.items)
-                        prev = self.quality_box.get()
-                        self.quality_box.configure(values=opts)
-                        self.quality_box.set(
-                            prev if prev in opts else "Best available"
-                        )
-                        self._update_counter()
+                        self._refresh_results_ui()
                         summary = (
                             f"{len(self.items)} video"
-                            f"{'s' if len(self.items) != 1 else ''} found from "
-                            f"{ok_links}/{total_links} link"
-                            f"{'s' if total_links != 1 else ''}"
+                            f"{'s' if len(self.items) != 1 else ''} found"
                         )
-                        if fail_links:
+                        if total_links:
                             summary += (
-                                f" ({fail_links} link"
-                                f"{'s' if fail_links != 1 else ''} failed - see above)"
+                                f" from {ok_links}/{total_links} link"
+                                f"{'s' if total_links != 1 else ''}"
                             )
+                            if fail_links:
+                                summary += (
+                                    f" ({fail_links} link"
+                                    f"{'s' if fail_links != 1 else ''} failed - see above)"
+                                )
                         summary += " - pick and press Download selected"
                         self.set_status(summary, GREEN if not fail_links else AMBER)
                 elif kind == "thumb":
