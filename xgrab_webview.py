@@ -185,13 +185,17 @@ if _QT_OK:
     class SearchWebViewDialog(QDialog):
         """In-app browser window: load, log in (here!), scroll, harvest."""
 
-        def __init__(self, parent, url: str, stop_event=None) -> None:
+        def __init__(self, parent, url: str, stop_event=None, on_new_ids=None) -> None:
             super().__init__(parent)
             self.setWindowTitle(f"{core.APP_NAME} - Search")
             self.resize(1120, 800)
             self.setModal(True)
             self.stop_event = stop_event or threading.Event()
             self.search_url = url
+            # called with a list of newly-found tweet ids after every scroll
+            # pass, so a worker thread can start resolving videos while
+            # scrolling is still going instead of waiting for it to finish
+            self.on_new_ids = on_new_ids
 
             # collector state
             self.found: dict[str, dict] = {}
@@ -375,9 +379,17 @@ if _QT_OK:
             if self._closed or self._phase != "scrolling":
                 return
             self._ping()
+            before = set(self.found)
             data = parse_harvest(raw)
             _n, h = merge_harvest(self.found, data)
             count = len(self.found)
+            if self.on_new_ids:
+                new_ids = [tid for tid in self.found if tid not in before]
+                if new_ids:
+                    try:
+                        self.on_new_ids(new_ids)
+                    except Exception:
+                        pass
             self._set_status(
                 f"Scrolling... {count} video post"
                 f"{'s' if count != 1 else ''} found"
@@ -438,15 +450,24 @@ if _QT_OK:
             self._timer.stop()
             super().closeEvent(event)
 
-    def run_search_dialog(parent, url: str, progress=None, stop_event=None):
+    def run_search_dialog(
+        parent, url: str, progress=None, stop_event=None, on_new_ids=None
+    ):
         """Open the in-app search window and return the harvest result.
 
         Returns ``{"found": {id: {"user","text"}}, "stopped": bool,
         "error": str | None}``.  Blocks (modal) until the page is fully
         scrolled or the user stops / closes the window; must be called from
         the GUI thread.
+
+        *on_new_ids*, if given, is called with each batch of newly-found
+        tweet ids as scrolling happens (same GUI thread) - lets the caller
+        start resolving videos in a background thread while the dialog is
+        still scrolling, instead of waiting for it to close.
         """
-        dlg = SearchWebViewDialog(parent, url, stop_event=stop_event)
+        dlg = SearchWebViewDialog(
+            parent, url, stop_event=stop_event, on_new_ids=on_new_ids
+        )
         if progress:
             dlg.status_hook = progress
         dlg.exec()

@@ -29,6 +29,7 @@ import re
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import xgrab_core as core
 
@@ -146,26 +147,6 @@ return JSON.stringify({ articles: arts, login: login, h: h });
 """
 
 
-def _resolve_one(tid: str) -> list[core.VideoItem]:
-    """Syndication lookup for a single tweet id ([] on soft failures)."""
-    try:
-        data = core.fetch_tweet(tid)
-    except core.XGrabError as exc:
-        msg = str(exc)
-        if "limiting" in msg:  # HTTP 429 - back off and retry once
-            time.sleep(RESOLVE_BACKOFF)
-            try:
-                data = core.fetch_tweet(tid)
-            except core.XGrabError:
-                return []
-        else:
-            return []  # deleted / private / photo-only post - skip
-    try:
-        return core.parse_videos(data, tid)
-    except Exception:
-        return []
-
-
 def resolve_ids(
     ids: list[str],
     progress=None,
@@ -175,8 +156,12 @@ def resolve_ids(
     """Turn collected tweet ids into VideoItems via the syndication engine.
 
     Shared by both collectors: the in-app webview (Qt build) and the Edge
-    fallback.  Emits *on_items* in chunks of :data:`RESOLVE_CHUNK` videos so
-    the GUI can render results while the rest resolve.
+    fallback. Delegates to core.fetch_videos_batch() for the actual network
+    work - same rate-limit handling (cooldown-and-retry passes) as a
+    directly-pasted link list gets, instead of the old single-retry-then-
+    give-up logic this used to have of its own. Emits *on_items* in chunks
+    of :data:`RESOLVE_CHUNK` videos so the GUI can render results while the
+    rest resolve.
     """
     progress = progress or (lambda msg: None)
     on_items = on_items or (lambda chunk: None)
@@ -184,18 +169,28 @@ def resolve_ids(
     total = len(ids)
     items: list[core.VideoItem] = []
     chunk: list[core.VideoItem] = []
-    for i, tid in enumerate(ids, start=1):
-        if stop_event.is_set():
-            break
-        progress(f"Resolving videos {i}/{total}...")
-        got = _resolve_one(tid)
-        if got:
-            items.extend(got)
-            chunk.extend(got)
-            if len(chunk) >= RESOLVE_CHUNK:
-                on_items(list(chunk))
-                chunk = []
-        time.sleep(RESOLVE_DELAY)
+    resolved = 0
+
+    def _on_item(got: list[core.VideoItem]) -> None:
+        nonlocal resolved, chunk
+        resolved += 1
+        items.extend(got)
+        chunk.extend(got)
+        progress(f"Resolving videos {resolved}/{total}...")
+        if len(chunk) >= RESOLVE_CHUNK:
+            on_items(list(chunk))
+            chunk = []
+
+    def _on_error(_url: str, msg: str) -> None:
+        progress(msg)
+
+    # A raw tweet id has no known author handle - "/i/status/<id>" matches
+    # the same URL pattern fetch_videos() parses (the username segment is
+    # discarded, only the numeric id is used).
+    urls = [f"https://x.com/i/status/{tid}" for tid in ids]
+    core.fetch_videos_batch(
+        urls, on_item=_on_item, on_error=_on_error, stop_event=stop_event
+    )
     if chunk:
         on_items(list(chunk))
     progress(f"Done - {len(items)} videos ready for download")
@@ -365,49 +360,83 @@ class SearchCollector:
                     "press Fetch videos again."
                 )
 
-            # -- auto-scroll to the very end of the feed ------------------
+            # -- auto-scroll to the very end of the feed, resolving videos
+            # for each newly-found id on a worker thread as scrolling goes,
+            # instead of resolving only after the whole feed is collected --
+            resolved: set[str] = set()
+            resolve_pool = ThreadPoolExecutor(max_workers=1)
+            pending: list = []
+
+            def resolve_new(ids: list[str]) -> None:
+                new_ids = [tid for tid in ids if tid not in resolved]
+                if not new_ids:
+                    return
+                resolved.update(new_ids)
+                resolve_ids(
+                    new_ids,
+                    progress=self.progress,
+                    on_items=self.on_items,
+                    stop_event=self.stop_event,
+                )
+
             self.progress("Scrolling the page - collecting videos...")
             started = time.monotonic()
             last_h = -1
             last_count = -1
             stable = 0
-            while not self.stop_event.is_set():
-                if time.monotonic() - started > HARD_CAP_SECONDS:
-                    self.progress("Safety cap reached - using what we have.")
-                    break
-                driver.execute_script(
-                    "window.scrollBy(0, Math.max(400, "
-                    "Math.round(window.innerHeight * 0.9)));"
-                )
-                time.sleep(SCROLL_STEP_SLEEP)
-                self._harvest(driver)
-                h = self._page_height(driver)
-                if h == last_h and len(self.found) == last_count:
-                    stable += 1
-                else:
-                    stable = 0
-                last_h = h
-                last_count = len(self.found)
-                if stable >= STABLE_ROUNDS:
-                    break
-                if last_count and last_count % 5 == 0:
-                    self.progress(
-                        f"Scrolling... {len(self.found)} video post"
-                        f"{'s' if len(self.found) != 1 else ''} found"
-                    )
             try:
-                driver.execute_script("window.scrollTo(0, 0);")
-            except Exception:
-                pass
+                while not self.stop_event.is_set():
+                    if time.monotonic() - started > HARD_CAP_SECONDS:
+                        self.progress("Safety cap reached - using what we have.")
+                        break
+                    driver.execute_script(
+                        "window.scrollBy(0, Math.max(400, "
+                        "Math.round(window.innerHeight * 0.9)));"
+                    )
+                    time.sleep(SCROLL_STEP_SLEEP)
+                    before = set(self.found)
+                    self._harvest(driver)
+                    new_ids = [tid for tid in self.found if tid not in before]
+                    if new_ids:
+                        pending.append(resolve_pool.submit(resolve_new, new_ids))
+                    h = self._page_height(driver)
+                    if h == last_h and len(self.found) == last_count:
+                        stable += 1
+                    else:
+                        stable = 0
+                    last_h = h
+                    last_count = len(self.found)
+                    if stable >= STABLE_ROUNDS:
+                        break
+                    if last_count and last_count % 5 == 0:
+                        self.progress(
+                            f"Scrolling... {len(self.found)} video post"
+                            f"{'s' if len(self.found) != 1 else ''} found"
+                        )
+                try:
+                    driver.execute_script("window.scrollTo(0, 0);")
+                except Exception:
+                    pass
 
-            if not self.found:
-                if self.stop_event.is_set():
-                    return []
-                raise core.XGrabError(
-                    "Scrolled the whole page but found no video posts.\n"
-                    "The search results may contain no videos."
-                )
-            return self._resolve_all()
+                if not self.found:
+                    if self.stop_event.is_set():
+                        return []
+                    raise core.XGrabError(
+                        "Scrolled the whole page but found no video posts.\n"
+                        "The search results may contain no videos."
+                    )
+                # resolving already overlapped with scrolling above - wait
+                # for the in-flight work, then catch any stragglers
+                for fut in pending:
+                    fut.result()
+                remaining = [
+                    tid for tid in self.found if tid not in resolved
+                ]
+                if remaining:
+                    resolve_new(remaining)
+                return []
+            finally:
+                resolve_pool.shutdown(wait=True)
         finally:
             if driver is not None:
                 try:

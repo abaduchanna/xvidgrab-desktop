@@ -13,6 +13,7 @@ Developed by www.3SVerse.com - part of the 3SVerse suite. MIT licensed.
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -438,28 +439,92 @@ class MainWindow(QMainWindow):
             ).start()
             return
         self.set_status("Opening the search page inside the app...", MUTED)
+        # resolve videos WHILE still scrolling instead of after: a worker
+        # thread drains tweet ids off this queue as the dialog finds them,
+        # so fetching and resolving overlap instead of running back-to-back.
+        id_queue: queue.Queue = queue.Queue()
+        self._search_resolved_ids: set[str] = set()
+        worker = threading.Thread(
+            target=self._search_resolve_worker, args=(id_queue,), daemon=True
+        )
+        worker.start()
+
+        def on_new_ids(ids: list) -> None:
+            for tid in ids:
+                id_queue.put(tid)
+
         try:
             result = xweb.run_search_dialog(
                 self,
                 search_url,
                 progress=lambda msg: self.set_status(msg, MUTED),
                 stop_event=self.fetch_stop,
+                on_new_ids=on_new_ids,
             )
         except Exception as exc:  # defensive - the dialog must never kill the app
             self.ctl.fetchError.emit(f"The in-app search window failed: {exc}")
-            self.ctl.fetchDone.emit()
+            id_queue.put(None)  # worker drains remaining ids then emits fetchDone
             return
-        self._after_search_dialog(result)
+        self._after_search_dialog(result, id_queue)
 
-    def _after_search_dialog(self, result: dict) -> None:
-        """Dialog closed: resolve whatever was collected in a worker thread."""
+    def _search_resolve_worker(self, id_queue: "queue.Queue") -> None:
+        """Drain tweet ids off *id_queue* and resolve them as they arrive.
+
+        Runs for the whole life of a search: starts as soon as scrolling
+        begins and keeps going until a ``None`` sentinel (pushed once the
+        collection dialog is done) and the queue is empty.
+        """
+        done = False
+        while True:
+            batch: list[str] = []
+            try:
+                item = id_queue.get(timeout=0.5)
+            except queue.Empty:
+                item = "__timeout__"
+            if item is None:
+                done = True
+            elif item != "__timeout__":
+                batch.append(item)
+            # drain whatever else is already queued without blocking, so a
+            # burst of new ids from one scroll pass resolves as one batch
+            while True:
+                try:
+                    nxt = id_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    done = True
+                else:
+                    batch.append(nxt)
+            batch = [
+                tid for tid in batch if tid not in self._search_resolved_ids
+            ]
+            if batch:
+                self._search_resolved_ids.update(batch)
+                try:
+                    xsearch.resolve_ids(
+                        batch,
+                        progress=lambda m: self.ctl.fetchStarted.emit(m),
+                        on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
+                        stop_event=self.fetch_stop,
+                    )
+                except Exception as exc:  # defensive
+                    self.ctl.fetchError.emit(f"Unexpected error: {exc}")
+            if done and id_queue.empty():
+                break
+        self.search_running = False
+        self.ctl.fetchDone.emit()
+
+    def _after_search_dialog(self, result: dict, id_queue: "queue.Queue") -> None:
+        """Dialog closed: hand any remaining ids to the resolve worker."""
         found = result.get("found") or {}
         err = result.get("error")
         if err:
+            id_queue.put(None)
             self.ctl.fetchError.emit(err)
-            self.ctl.fetchDone.emit()
             return
         if not found:
+            id_queue.put(None)
             if result.get("stopped"):
                 self.set_status("Collection stopped.", AMBER)
             else:
@@ -467,24 +532,13 @@ class MainWindow(QMainWindow):
                     "Scrolled the whole page but found no video posts.\n"
                     "The search results may contain no videos."
                 )
-            self.ctl.fetchDone.emit()
             return
-
-        def worker():
-            try:
-                xsearch.resolve_ids(
-                    list(found),
-                    progress=lambda m: self.ctl.fetchStarted.emit(m),
-                    on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
-                    stop_event=self.fetch_stop,
-                )
-            except Exception as exc:  # defensive
-                self.ctl.fetchError.emit(f"Unexpected error: {exc}")
-            finally:
-                self.search_running = False
-                self.ctl.fetchDone.emit()
-
-        threading.Thread(target=worker, daemon=True).start()
+        # on_new_ids already queued everything the dialog ever found, but
+        # push the full set again (a no-op for ones the worker already
+        # resolved) as a safety net in case a late batch was missed.
+        for tid in found:
+            id_queue.put(tid)
+        id_queue.put(None)
 
     def _do_search_fetch(self, search_url: str) -> None:
         """Worker (fallback only): scroll the page in Edge and resolve."""
