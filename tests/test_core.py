@@ -176,6 +176,48 @@ class TestParseVideos:
     def test_photo_only_post_has_no_videos(self):
         assert core.parse_videos(PHOTO_ONLY_SAMPLE, "999") == []
 
+    def test_quote_tweet_falls_back_to_quoted_media(self):
+        # the outer (quoting) tweet has no media of its own - search's
+        # scroll-harvest can still pick it up because a video shows inside
+        # its embedded quote card, so without this fallback this reports
+        # zero videos despite one clearly being on the page
+        data = {
+            "id_str": "1000",
+            "text": "look at this",
+            "user": {"screen_name": "outerUser"},
+            "mediaDetails": [],
+            "quoted_tweet": {
+                "id_str": "2000",
+                "text": "original clip",
+                "user": {"screen_name": "quotedUser"},
+                "mediaDetails": [
+                    {
+                        "type": "video",
+                        "media_url_https": "https://pbs.twimg.com/thumb.jpg",
+                        "video_info": {
+                            "duration_millis": 5000,
+                            "variants": [
+                                {
+                                    "content_type": "video/mp4",
+                                    "bitrate": 832000,
+                                    "url": "https://video.twimg.com/ext_tw_video/2000/vid/720x1280/a.mp4",
+                                },
+                            ],
+                        },
+                    }
+                ],
+            },
+        }
+        items = core.parse_videos(data, "1000")
+        assert len(items) == 1
+        assert items[0].uploader == "quotedUser"
+        assert items[0].webpage_url == "https://x.com/quotedUser/status/2000"
+        assert items[0].formats[0].url.endswith("a.mp4")
+
+    def test_quote_tweet_field_absent_stays_empty(self):
+        data = {"id_str": "3000", "text": "plain", "user": {"screen_name": "u"}, "mediaDetails": []}
+        assert core.parse_videos(data, "3000") == []
+
 
 # ---------------------------------------------------------------- selection
 class TestPickFormat:

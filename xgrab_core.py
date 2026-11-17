@@ -277,16 +277,38 @@ def _dims_from_url(url: str) -> tuple[int, int]:
 
 
 def parse_videos(data: dict, tweet_id: str) -> list[VideoItem]:
-    """Turn a syndication JSON payload into a list of VideoItem."""
+    """Turn a syndication JSON payload into a list of VideoItem.
+
+    A quote tweet has no media of its own - the video lives on the tweet
+    it quotes, exposed here under "quoted_tweet"/"quoted_status". Search's
+    scroll-harvest can pick up the outer (quoting) tweet's id when a video
+    shows inside its embedded quote card, so without this fallback a
+    perfectly valid video post reports "No videos found in that post".
+    """
+    source = data
     media = data.get("mediaDetails") or data.get("media_details") or []
+    if not media:
+        quoted = (
+            data.get("quoted_tweet")
+            or data.get("quotedTweet")
+            or data.get("quoted_status")
+            or {}
+        )
+        q_media = quoted.get("mediaDetails") or quoted.get("media_details") or []
+        if q_media:
+            source = quoted
+            media = q_media
     video_media = [
         m
         for m in media
         if m.get("type") in ("video", "animated_gif") and m.get("video_info")
     ]
     total = len(video_media)
-    user = (data.get("user") or {}).get("screen_name") or "x"
-    text = data.get("text") or ""
+    user = (source.get("user") or {}).get("screen_name") or "x"
+    text = data.get("text") or source.get("text") or ""
+    # when sourced from a quoted tweet, link to ITS id - the outer tweet_id
+    # has no video of its own, so a link built from it wouldn't show one
+    link_id = str(source.get("id_str") or source.get("id") or "") or tweet_id
     items: list[VideoItem] = []
     for i, m in enumerate(video_media, start=1):
         variants = (m.get("video_info") or {}).get("variants") or []
@@ -326,7 +348,7 @@ def parse_videos(data: dict, tweet_id: str) -> list[VideoItem]:
                 media_type=m.get("type") or "video",
                 thumbnail_url=m.get("media_url_https") or "",
                 formats=fmts,
-                webpage_url=f"https://x.com/{user}/status/{tweet_id}"
+                webpage_url=f"https://x.com/{user}/status/{link_id}"
                 + (f"/video/{i}" if total > 1 else ""),
             )
         )
