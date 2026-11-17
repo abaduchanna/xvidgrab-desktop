@@ -1,7 +1,9 @@
 """Offline tests for the XVidGrab Desktop core engine (no network)."""
 
+import json
 import os
 import sys
+from unittest import mock
 
 import pytest
 
@@ -217,6 +219,21 @@ class TestParseVideos:
     def test_quote_tweet_field_absent_stays_empty(self):
         data = {"id_str": "3000", "text": "plain", "user": {"screen_name": "u"}, "mediaDetails": []}
         assert core.parse_videos(data, "3000") == []
+
+
+class TestFetchTweetTombstone:
+    """Real-world capture: search's scroll-harvester can collect a tweet id
+    whose video is only visible to a logged-in browser. The public
+    syndication endpoint this app uses (no login) then returns a
+    TweetTombstone placeholder instead of the tweet - no media to recover,
+    ever, for that id. fetch_tweet() must say so clearly instead of letting
+    it fall through to a generic "no videos found" message."""
+
+    def test_tombstone_raises_clear_error(self):
+        raw = json.dumps({"__typename": "TweetTombstone", "tombstone": {}}).encode()
+        with mock.patch.object(core, "_http_get", return_value=raw):
+            with pytest.raises(core.XGrabError, match="age-restricted"):
+                core.fetch_tweet("123")
 
 
 # ---------------------------------------------------------------- selection

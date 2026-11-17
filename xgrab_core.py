@@ -262,11 +262,25 @@ def fetch_tweet(tweet_id: str) -> dict:
             "X is temporarily limiting requests. Wait a minute and try again."
         ) from last_exc
     try:
-        return json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise XGrabError(
             "Unexpected response from X - the extractor may need an update."
         ) from exc
+    if isinstance(data, dict) and data.get("__typename") == "TweetTombstone":
+        # X's PUBLIC syndication endpoint (no login) refuses to serve
+        # sensitive/age-restricted content and returns this placeholder
+        # instead of the tweet - same thing for a suspended/limited author.
+        # There is no video payload to recover here no matter how many
+        # times this is retried; a logged-in browser session (which the
+        # in-app search browser has) can still SEE the post, which is why
+        # this looks like a contradiction from the scroll/resolve flow.
+        raise XGrabError(
+            "This post is age-restricted, sensitive, or otherwise limited - "
+            "X won't serve it through the public (no-login) API this app "
+            "uses, even though a logged-in browser can see it."
+        )
+    return data
 
 
 def _dims_from_url(url: str) -> tuple[int, int]:
