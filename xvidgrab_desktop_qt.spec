@@ -7,7 +7,14 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('icons', 'icons')],
-    hiddenimports=[],
+    # QtWebEngine = the embedded browser for search pages / in-app X login
+    hiddenimports=[
+        'PySide6.QtWebEngineWidgets',
+        'PySide6.QtWebEngineCore',
+        'PySide6.QtWebChannel',
+        'PySide6.QtPrintSupport',
+        'PySide6.QtNetwork',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,5 +1,6 @@
 # XVidGrab Desktop: thumbnails (both GUIs) + the PySide6 GUI
-# + selenium for the search-page collector (Edge automation)
+# + selenium = fallback search collector (Edge automation); the Qt
+# build primarily uses the built-in QtWebEngine browser (in PySide6)
 # Developed by www.3SVerse.com
 
 Pillow>=10.0.0

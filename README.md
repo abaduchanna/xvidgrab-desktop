@@ -16,8 +16,11 @@ page** with live thumbnails and the best quality available (480p, 720p, 1080p,
 and download them in one go.
 
 Paste a **search link** (`x.com/search?q=...`) instead and the app opens the
-results in Edge, **auto-scrolls the page to the very end** and puts **every
-video on the page** into the download list — thumbnails, qualities, all of it.
+results **in a window inside the app itself**, **auto-scrolls the page to the
+very end** and puts **every video on the page** into the download list —
+thumbnails, qualities, all of it. No external browser, no browser windows —
+when X asks for a login you log in right inside the XVidGrab window (once;
+the app remembers you).
 
 Two polished interfaces are included, both with **list view and grid view**:
 
@@ -42,11 +45,12 @@ same public embed data source X serves to every website on the internet.
 
 ## Features
 
-- **Search-page fetching** — paste a search link like
-  `https://x.com/search?q=backshots&src=recent_search_click` and the app
-  opens the results in Edge, scrolls to the very end of the feed and lists
-  **every video on the page** for download (press **Stop** any time to use
-  what has been collected so far)
+- **Search-page fetching, fully in-app (v1.2.0)** — paste a search link like
+  `https://x.com/search?q=backshots&src=recent_search_click` and the page
+  opens **inside the app** (embedded Chromium). The app scrolls to the very
+  end of the feed and lists **every video on the page** for download (press
+  **Stop** any time to use what has been collected so far). **The X login
+  happens inside the app window too** — one time only, then remembered.
 - **Paste a link, get everything** — every video of the post appears with its
   thumbnail, duration and available qualities (multi-video posts show all of
   them)
@@ -69,12 +73,15 @@ same public embed data source X serves to every website on the internet.
 ## How search-page fetching works
 
 X has no public search API and search results need a logged-in session, so
-the desktop app loads the page in a real **Microsoft Edge** window
-(selenium):
+the Qt build loads the page in an **embedded Chromium browser window inside
+the app** (PySide6 QtWebEngine — the same engine Edge uses):
 
-1. The collector opens your search URL in Edge using its own persistent
-   profile (`XVidGrab-EdgeProfile` in your home folder). **Log in to X once
-   when it asks** — every later run reuses that session automatically.
+1. The search page opens in the XVidGrab window itself. If X asks for a
+   login, an amber banner appears — **log in right there** (one time only).
+   The session lives in the app's own persistent profile
+   (`XVidGrab-WebViewProfile` in your home folder), so every later search —
+   and every later app start — is already logged in. No browser windows,
+   nothing opens outside the app.
 2. It auto-scrolls the feed to the very end — the same proven collector the
    XVidGrab extension's *Fetch All* uses (feed end = page height and collected
    count stable, 12-minute safety cap).
@@ -85,8 +92,9 @@ the desktop app loads the page in a real **Microsoft Edge** window
    every video lands in the normal list with thumbnail, duration and quality
    options — ready to download.
 
-Requirements: Microsoft Edge installed (pre-installed on Windows 10/11). The
-EXE downloads the matching Edge driver automatically on first use.
+The lightweight Tkinter build keeps the legacy route (selenium + a real Edge
+window with its own `XVidGrab-EdgeProfile`); it needs Microsoft Edge
+installed. The Qt build needs nothing beyond the app itself.
 
 ## Requirements
 
@@ -109,8 +117,10 @@ EXE downloads the matching Edge driver automatically on first use.
    like `https://x.com/search?q=cats&f=live` — and paste it into the
    top bar (several post links in one paste are fine).
 3. Press **Fetch videos**. Every video on the page shows up as a thumbnail
-   card. For search links, Edge opens and the app scrolls the page to the end
-   first (press **Stop** any time to use what has been collected so far).
+   card. For search links, the page opens in a window **inside the app** and
+   the app scrolls it to the end first — if X asks you to log in, do it right
+   there in that window (once). Press **Stop** any time to use what has been
+   collected so far.
 4. Switch between **Grid** and **List** views any time.
 5. Tick the videos you want — or press **Select all**.
 6. Pick a quality (default: **Best available**) and a folder if you like.
@@ -121,8 +131,9 @@ EXE downloads the matching Edge driver automatically on first use.
 
 - Works with **public** posts. Deleted, private or age-gated posts can't be
   fetched (you'll get a clear error message instead).
-- Search pages need an X login (X requires it); the app waits while you log
-  in inside the Edge window, once.
+- Search pages need an X login (X requires it); in the Qt build you log in
+  once **inside the app window** and the app remembers you (the Tkinter
+  build asks inside its Edge window instead).
 - Animated GIFs are downloaded as looping MP4 videos (that is how X serves
   them).
 - If X changes its public embed data, the engine may need an update — pull

@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 
 import xgrab_core as core
 import xgrab_search as xsearch
+import xgrab_webview as xweb
 
 BG = "#07060b"
 SURFACE = "#0d0c14"
@@ -208,7 +209,7 @@ class MainWindow(QMainWindow):
         f.setPointSize(13)
         f.setBold(True)
         name.setFont(f)
-        sub = QLabel("Paste an X post link - or a search link (x.com/search?q=...) to grab every video on the page")
+        sub = QLabel("Paste an X post link - or a search link (x.com/search?q=...) - search pages open inside the app, browser-free")
         sub.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
         hleft.addWidget(name)
         hleft.addWidget(sub)
@@ -352,9 +353,6 @@ class MainWindow(QMainWindow):
                 search_url = None
 
         def do_fetch():
-            if search_url:
-                self._do_search_fetch(search_url)
-                return
             urls = core.parse_status_urls(text)
             if not urls and core._TCO_RE.search(text):
                 try:
@@ -391,23 +389,86 @@ class MainWindow(QMainWindow):
         self._clear_results()
         self._update_counter()
         if search_url:
-            self.search_running = True
-            self.fetch_stop.clear()
-            # keep the button alive as a Stop control during collection
-            self.fetch_btn.setEnabled(True)
-            self.fetch_btn.setText("Stop")
-        else:
-            self.fetch_btn.setEnabled(False)
-            self.fetch_btn.setText("Fetching...")
-        self.set_status(
-            "Collecting every video from the search page..."
-            if search_url else "Fetching...",
-            MUTED,
-        )
+            self._begin_search(search_url)
+            return
+        self.fetch_btn.setEnabled(False)
+        self.fetch_btn.setText("Fetching...")
+        self.set_status("Fetching...", MUTED)
         threading.Thread(target=do_fetch, daemon=True).start()
 
+    # ------------------------------------------------------ search (in-app)
+    def _begin_search(self, search_url: str) -> None:
+        """Search links: collect inside the in-app browser window.
+
+        The embedded window (QtWebEngine) loads the page, hosts the X login
+        when needed and auto-scrolls to the end - nothing ever opens outside
+        the app.  Only when the embedded browser is unavailable does the
+        legacy Edge automation run as a fallback.
+        """
+        self.search_running = True
+        self.fetch_stop.clear()
+        # keep the button alive as a Stop control during collection
+        self.fetch_btn.setEnabled(True)
+        self.fetch_btn.setText("Stop")
+        if not xweb.webengine_available():
+            self.set_status(
+                "Built-in browser unavailable - using Edge instead...", AMBER
+            )
+            threading.Thread(
+                target=lambda: self._do_search_fetch(search_url), daemon=True
+            ).start()
+            return
+        self.set_status("Opening the search page inside the app...", MUTED)
+        try:
+            result = xweb.run_search_dialog(
+                self,
+                search_url,
+                progress=lambda msg: self.set_status(msg, MUTED),
+                stop_event=self.fetch_stop,
+            )
+        except Exception as exc:  # defensive - the dialog must never kill the app
+            self.ctl.fetchError.emit(f"The in-app search window failed: {exc}")
+            self.ctl.fetchDone.emit()
+            return
+        self._after_search_dialog(result)
+
+    def _after_search_dialog(self, result: dict) -> None:
+        """Dialog closed: resolve whatever was collected in a worker thread."""
+        found = result.get("found") or {}
+        err = result.get("error")
+        if err:
+            self.ctl.fetchError.emit(err)
+            self.ctl.fetchDone.emit()
+            return
+        if not found:
+            if result.get("stopped"):
+                self.set_status("Collection stopped.", AMBER)
+            else:
+                self.ctl.fetchError.emit(
+                    "Scrolled the whole page but found no video posts.\n"
+                    "The search results may contain no videos."
+                )
+            self.ctl.fetchDone.emit()
+            return
+
+        def worker():
+            try:
+                xsearch.resolve_ids(
+                    list(found),
+                    progress=lambda m: self.ctl.fetchStarted.emit(m),
+                    on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
+                    stop_event=self.fetch_stop,
+                )
+            except Exception as exc:  # defensive
+                self.ctl.fetchError.emit(f"Unexpected error: {exc}")
+            finally:
+                self.search_running = False
+                self.ctl.fetchDone.emit()
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _do_search_fetch(self, search_url: str) -> None:
-        """Worker: scroll the search page in Edge and resolve every video."""
+        """Worker (fallback only): scroll the page in Edge and resolve."""
         try:
             collector = xsearch.SearchCollector(
                 search_url,
@@ -856,6 +917,9 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    # QtWebEngine (the in-app browser used for search pages) requires this
+    # attribute to be set BEFORE the QApplication is constructed.
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     app.setStyleSheet(QSS)
     win = MainWindow()

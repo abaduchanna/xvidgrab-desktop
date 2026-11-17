@@ -35,6 +35,7 @@ import xgrab_core as core
 __all__ = [
     "is_search_url",
     "SearchCollector",
+    "resolve_ids",
     "COLLECT_JS",
     "STATE_JS",
 ]
@@ -54,6 +55,7 @@ HARD_CAP_SECONDS = 12 * 60      # safety cap: 12 minutes
 LOGIN_WAIT_SECONDS = 10 * 60    # wait up to 10 min for the user to log in
 RESOLVE_DELAY = 0.2             # pause between syndication lookups
 RESOLVE_BACKOFF = 5.0           # extra pause when X starts rate-limiting
+RESOLVE_CHUNK = 10              # videos per on_items callback
 
 # Persistent automation profile - log in once, reused by every later run.
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), "XVidGrab-EdgeProfile")
@@ -142,6 +144,62 @@ var h = document.scrollingElement
   : document.documentElement.scrollHeight;
 return JSON.stringify({ articles: arts, login: login, h: h });
 """
+
+
+def _resolve_one(tid: str) -> list[core.VideoItem]:
+    """Syndication lookup for a single tweet id ([] on soft failures)."""
+    try:
+        data = core.fetch_tweet(tid)
+    except core.XGrabError as exc:
+        msg = str(exc)
+        if "limiting" in msg:  # HTTP 429 - back off and retry once
+            time.sleep(RESOLVE_BACKOFF)
+            try:
+                data = core.fetch_tweet(tid)
+            except core.XGrabError:
+                return []
+        else:
+            return []  # deleted / private / photo-only post - skip
+    try:
+        return core.parse_videos(data, tid)
+    except Exception:
+        return []
+
+
+def resolve_ids(
+    ids: list[str],
+    progress=None,
+    on_items=None,
+    stop_event: threading.Event | None = None,
+) -> list[core.VideoItem]:
+    """Turn collected tweet ids into VideoItems via the syndication engine.
+
+    Shared by both collectors: the in-app webview (Qt build) and the Edge
+    fallback.  Emits *on_items* in chunks of :data:`RESOLVE_CHUNK` videos so
+    the GUI can render results while the rest resolve.
+    """
+    progress = progress or (lambda msg: None)
+    on_items = on_items or (lambda chunk: None)
+    stop_event = stop_event or threading.Event()
+    total = len(ids)
+    items: list[core.VideoItem] = []
+    chunk: list[core.VideoItem] = []
+    for i, tid in enumerate(ids, start=1):
+        if stop_event.is_set():
+            break
+        progress(f"Resolving videos {i}/{total}...")
+        got = _resolve_one(tid)
+        if got:
+            items.extend(got)
+            chunk.extend(got)
+            if len(chunk) >= RESOLVE_CHUNK:
+                on_items(list(chunk))
+                chunk = []
+        time.sleep(RESOLVE_DELAY)
+    if chunk:
+        on_items(list(chunk))
+    progress(f"Done - {len(items)} videos ready for download")
+    return items
 
 
 class SearchCollector:
@@ -371,41 +429,9 @@ class SearchCollector:
 
     def _resolve_all(self) -> list[core.VideoItem]:
         """Turn every collected tweet id into VideoItems via syndication."""
-        ids = list(self.found.keys())
-        total = len(ids)
-        items: list[core.VideoItem] = []
-        chunk: list[core.VideoItem] = []
-        for i, tid in enumerate(ids, start=1):
-            if self.stop_event.is_set():
-                break
-            self.progress(f"Resolving videos {i}/{total}...")
-            got = self._resolve_one(tid)
-            if got:
-                items.extend(got)
-                chunk.extend(got)
-                if len(chunk) >= 10:
-                    self.on_items(list(chunk))
-                    chunk = []
-            time.sleep(RESOLVE_DELAY)
-        if chunk:
-            self.on_items(list(chunk))
-        self.progress(f"Done - {len(items)} videos ready for download")
-        return items
-
-    def _resolve_one(self, tid: str) -> list[core.VideoItem]:
-        try:
-            data = core.fetch_tweet(tid)
-        except core.XGrabError as exc:
-            msg = str(exc)
-            if "limiting" in msg:  # HTTP 429 - back off and retry once
-                time.sleep(RESOLVE_BACKOFF)
-                try:
-                    data = core.fetch_tweet(tid)
-                except core.XGrabError:
-                    return []
-            else:
-                return []  # deleted / private / photo-only post - skip
-        try:
-            return core.parse_videos(data, tid)
-        except Exception:
-            return []
+        return resolve_ids(
+            list(self.found.keys()),
+            progress=self.progress,
+            on_items=self.on_items,
+            stop_event=self.stop_event,
+        )
