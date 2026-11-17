@@ -358,13 +358,11 @@ def parse_videos(data: dict, tweet_id: str) -> list[VideoItem]:
 def _dump_debug_json(tweet_id: str, data: dict) -> str | None:
     """Save the raw syndication JSON for a "no videos found" post.
 
-    Only runs when XVIDGRAB_DEBUG is set in the environment - this is for
-    diagnosing a specific false "no videos" report without logging
-    anything by default. Returns the saved path, or None on any failure
-    (debug dumping must never break a real fetch).
+    Always on (no switch to flip) so a real failing case can be captured
+    and shared without extra setup - one small JSON file per post, saved
+    next to the app's other local files. Returns the saved path, or None
+    on any failure (debug dumping must never break a real fetch).
     """
-    if not os.environ.get("XVIDGRAB_DEBUG"):
-        return None
     try:
         debug_dir = os.path.join(os.path.expanduser("~"), ".xvidgrab-desktop-debug")
         os.makedirs(debug_dir, exist_ok=True)
