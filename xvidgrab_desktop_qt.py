@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
@@ -140,7 +141,7 @@ class Controller(QObject):
     fetchStarted = Signal(str)                    # status text
     metaReady = Signal(list)                      # VideoItem list
     fetchError = Signal(str)                      # friendly error
-    fetchDone = Signal()
+    fetchDone = Signal(int, int, int)             # ok_links, failed_links, total_links
     thumbReady = Signal(tuple, bytes)             # key, image bytes
     itemProgress = Signal(tuple, int, object)     # key, downloaded, total
     itemDone = Signal(tuple, str)                 # key, path
@@ -369,15 +370,25 @@ class MainWindow(QMainWindow):
             self.ctl.fetchStarted.emit(
                 f"Fetching {len(urls)} link{'s' if len(urls) > 1 else ''}..."
             )
-            for u in urls:
+            ok_count = 0
+            fail_count = 0
+            for i, u in enumerate(urls):
+                if i > 0:
+                    # A large batch hammering X's syndication endpoint with
+                    # no gap trips its rate limit after a handful of
+                    # requests, silently failing the rest - space them out.
+                    time.sleep(core.BATCH_FETCH_DELAY)
                 try:
                     items = core.fetch_videos(u)
                     self.ctl.metaReady.emit(items)
+                    ok_count += 1
                 except core.XGrabError as exc:
                     self.ctl.fetchError.emit(str(exc))
+                    fail_count += 1
                 except Exception as exc:  # defensive
                     self.ctl.fetchError.emit(f"Unexpected error: {exc}")
-            self.ctl.fetchDone.emit()
+                    fail_count += 1
+            self.ctl.fetchDone.emit(ok_count, fail_count, len(urls))
 
         self.fetching = True
         # reset previous results
@@ -498,7 +509,7 @@ class MainWindow(QMainWindow):
         if not self.items:
             QMessageBox.warning(self, core.APP_NAME, err)
 
-    def _on_fetch_done(self) -> None:
+    def _on_fetch_done(self, ok_links: int, fail_links: int, total_links: int) -> None:
         self.fetching = False
         self.search_running = False
         self.fetch_btn.setEnabled(True)
@@ -514,12 +525,14 @@ class MainWindow(QMainWindow):
             if prev in opts:
                 self.quality_box.setCurrentText(prev)
             self._update_counter()
-            self.set_status(
-                f"{len(self.items)} video"
-                f"{'s' if len(self.items) > 1 else ''} found - "
-                f"pick and press Download selected",
-                GREEN,
+            summary = (
+                f"{len(self.items)} video{'s' if len(self.items) != 1 else ''} "
+                f"found from {ok_links}/{total_links} link{'s' if total_links != 1 else ''}"
             )
+            if fail_links:
+                summary += f" ({fail_links} link{'s' if fail_links != 1 else ''} failed - see above)"
+            summary += " - pick and press Download selected"
+            self.set_status(summary, GREEN if not fail_links else AMBER)
 
     # ------------------------------------------------------------ results
     def _clear_results(self):

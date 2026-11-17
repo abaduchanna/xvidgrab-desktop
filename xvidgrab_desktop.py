@@ -17,6 +17,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, TOP, W, X, Y, filedialog, messagebox, ttk
@@ -345,15 +346,25 @@ class App(tk.Tk):
             self._last_urls = urls
             self.msg_q.put(("fetchstart", "", f"Fetching {len(urls)} link"
                              f"{'s' if len(urls) > 1 else ''}..."))
-            for u in urls:
+            ok_count = 0
+            fail_count = 0
+            for i, u in enumerate(urls):
+                if i > 0:
+                    # A large batch hammering X's syndication endpoint with
+                    # no gap trips its rate limit after a handful of
+                    # requests, silently failing the rest - space them out.
+                    time.sleep(core.BATCH_FETCH_DELAY)
                 try:
                     items = core.fetch_videos(u)
                     self.msg_q.put(("meta", u, items))
+                    ok_count += 1
                 except core.XGrabError as exc:
                     self.msg_q.put(("fetcherr", u, str(exc)))
+                    fail_count += 1
                 except Exception as exc:  # defensive
                     self.msg_q.put(("fetcherr", u, f"Unexpected error: {exc}"))
-            self.msg_q.put(("fetchdone", "", ""))
+                    fail_count += 1
+            self.msg_q.put(("fetchdone", "", (ok_count, fail_count, len(urls))))
 
         self.fetching = True
         # reset previous results
@@ -718,6 +729,7 @@ class App(tk.Tk):
                     self.fetching = False
                     self.search_running = False
                     self.fetch_btn.configure(state="normal", text="Fetch videos")
+                    ok_links, fail_links, total_links = msg[2] if msg[2] else (0, 0, 0)
                     if self.items:
                         self._clear_results()
                         self.render_cards()
@@ -729,11 +741,19 @@ class App(tk.Tk):
                             prev if prev in opts else "Best available"
                         )
                         self._update_counter()
-                        self.set_status(
+                        summary = (
                             f"{len(self.items)} video"
-                            f"{'s' if len(self.items) > 1 else ''} found - "
-                            f"pick and press Download selected", GREEN
+                            f"{'s' if len(self.items) != 1 else ''} found from "
+                            f"{ok_links}/{total_links} link"
+                            f"{'s' if total_links != 1 else ''}"
                         )
+                        if fail_links:
+                            summary += (
+                                f" ({fail_links} link"
+                                f"{'s' if fail_links != 1 else ''} failed - see above)"
+                            )
+                        summary += " - pick and press Download selected"
+                        self.set_status(summary, GREEN if not fail_links else AMBER)
                 elif kind == "thumb":
                     _, key, data = msg
                     try:

@@ -40,6 +40,16 @@ USER_AGENT = (
 SYNDICATION_ENDPOINT = "https://cdn.syndication.twimg.com/tweet-result"
 HTTP_TIMEOUT = 20
 MAX_TCO_EXPANSIONS = 25
+# Pasting many links at once (a thread, a saved list) fetches each post
+# sequentially from the same unauthenticated syndication endpoint; firing
+# them back-to-back with no gap reliably trips its rate limit after only a
+# handful of requests, silently failing the rest. A small delay between
+# requests in a batch keeps a large batch well under that limit.
+BATCH_FETCH_DELAY = 0.4
+# Transient 429/403 responses (the endpoint is momentarily rate-limiting)
+# are retried with backoff before being treated as a real failure.
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_BACKOFF_BASE = 1.5
 
 # x.com/<user>/status/<id>  (accepts twitter.com, www., mobile., an optional
 # leading @ on the handle, and trailing /photo/N, /video/N, query strings and
@@ -198,24 +208,40 @@ def _http_get(url: str, retries: int = 3) -> bytes:
 
 
 def fetch_tweet(tweet_id: str) -> dict:
-    """Fetch the public syndication JSON for one post id."""
+    """Fetch the public syndication JSON for one post id.
+
+    Retries a transient 429/403 (rate limit) a few times with backoff
+    before giving up - in a large batch these are usually momentary, not
+    a hard block."""
     url = _syndication_url(tweet_id)
-    try:
-        raw = _http_get(url)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+    raw = None
+    last_exc: urllib.error.HTTPError | None = None
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            raw = _http_get(url)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise XGrabError(
+                    "Post not found - it may be deleted, private, or the link is wrong."
+                ) from exc
+            if exc.code in (403, 429):
+                last_exc = exc
+                if attempt < RATE_LIMIT_RETRIES:
+                    time.sleep(RATE_LIMIT_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                raise XGrabError(
+                    "X is temporarily limiting requests. Wait a minute and try again."
+                ) from exc
+            raise XGrabError(f"X returned HTTP {exc.code} for that post.") from exc
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
             raise XGrabError(
-                "Post not found - it may be deleted, private, or the link is wrong."
+                "Could not reach X - check your internet connection and try again."
             ) from exc
-        if exc.code in (403, 429):
-            raise XGrabError(
-                "X is temporarily limiting requests. Wait a minute and try again."
-            ) from exc
-        raise XGrabError(f"X returned HTTP {exc.code} for that post.") from exc
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+    if raw is None:
         raise XGrabError(
-            "Could not reach X - check your internet connection and try again."
-        ) from exc
+            "X is temporarily limiting requests. Wait a minute and try again."
+        ) from last_exc
     try:
         return json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
