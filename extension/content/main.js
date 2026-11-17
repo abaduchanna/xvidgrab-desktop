@@ -485,9 +485,12 @@
   function queueAutoDownloads() {
     if (!fetchAll.running || !fetchAll.autoDownload) return;
     for (const rec of store.values()) {
-      if (fetchAll.queued.has(rec.key)) continue;
-      const src = pickSource(rec.sources || []);
-      if (!src) continue; /* no mp4 yet - this record may still fill in */
+      /* Queue as soon as a record exists, even with no mp4 yet - passive
+       * page sniffing often only catches an HLS stream or nothing at all
+       * for a post that was never played while scrolling past it. The
+       * queue actively resolves it (same fallback the manual per-post
+       * button uses) instead of silently skipping it forever. */
+      if (fetchAll.queued.has(rec.key) || !rec.tweetId) continue;
       fetchAll.queued.add(rec.key);
       autoQueue.push(rec.key);
       logAuto("Found video" + (rec.author ? " @" + rec.author : "") + " - queued for download");
@@ -501,9 +504,25 @@
       while (autoQueue.length) {
         if (!fetchAll.running) break; /* Stop pressed */
         const key = autoQueue.shift();
-        const rec = store.get(key);
-        const src = rec && pickSource(rec.sources || []);
-        if (!rec || !src) continue;
+        let rec = store.get(key);
+        let src = rec && pickSource(rec.sources || []);
+        if (!src && rec && rec.tweetId && !resolving.has(rec.tweetId)) {
+          /* same active fallback the manual per-post download button uses -
+           * passive sniffing alone often never fills in an mp4 for a post
+           * that was scrolled past without being played */
+          logAuto("Resolving video" + (rec.author ? " @" + rec.author : "") + " ...");
+          resolving.add(rec.tweetId);
+          try { await resolveTweet(rec.tweetId); }
+          finally { resolving.delete(rec.tweetId); }
+          rec = store.get(key);
+          src = rec && pickSource(rec.sources || []);
+        }
+        if (!rec || !src) {
+          fetchAll.failedCount += 1;
+          logAuto("FAILED" + (rec && rec.author ? " @" + rec.author : "") +
+            " - no downloadable video found for this post");
+          continue;
+        }
         const filename = XVG.fileNameFor(rec, src);
         logAuto("Downloading " + filename + " ...");
         try {
