@@ -43,17 +43,19 @@ from PySide6.QtWidgets import (
 
 import xgrab_core as core
 
-BG = "#0A0D12"
-SURFACE = "#10141B"
-CARD = "#161B24"
-BORDER = "#232B39"
-TEXT = "#E7E9EA"
-MUTED = "#8B98A5"
-ACCENT = "#1D9BF0"
-GREEN = "#00BA7C"
-RED = "#F4212E"
-AMBER = "#FFD400"
-THUMB_BG = "#0D1420"
+BG = "#07060b"
+SURFACE = "#0d0c14"
+CARD = "#0d0c14"
+BORDER = "#232130"
+TEXT = "#f5f1e6"
+MUTED = "#9b97b3"
+ACCENT = "#6ee7ef"
+ACCENT_HOVER = "#9deff5"
+MAGENTA = "#e44bd7"
+GREEN = "#c7ef70"
+RED = "#ef6a52"
+AMBER = "#f5c518"
+THUMB_BG = "#12101a"
 
 GRID_CARD_W = 200
 GRID_THUMB_H = 112
@@ -77,10 +79,10 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: {CARD}; }}
 QPushButton:disabled {{ color: {MUTED}; background: {SURFACE}; }}
-QPushButton#primary {{ background: {ACCENT}; color: #FFFFFF; }}
-QPushButton#primary:hover {{ background: #1A8CD8; }}
-QPushButton#primary:disabled {{ background: #12557d; color: #cfe8fb; }}
-QPushButton#active {{ background: {ACCENT}; color: #FFFFFF; }}
+QPushButton#primary {{ background: {ACCENT}; color: {BG}; }}
+QPushButton#primary:hover {{ background: {ACCENT_HOVER}; }}
+QPushButton#primary:disabled {{ background: {BORDER}; color: {MUTED}; }}
+QPushButton#active {{ background: {ACCENT}; color: {BG}; }}
 QComboBox {{
     background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
     border-radius: 6px; padding: 5px 8px;
@@ -299,6 +301,23 @@ class MainWindow(QMainWindow):
             bottom.addWidget(w)
         root.addLayout(bottom)
 
+        # 3SVerse brand footer (same standard as License Studio / WiFi
+        # Transfer): developed-by centered, version on the right.
+        footer = QWidget()
+        footer.setStyleSheet(f"background: {SURFACE}; border-top: 1px solid {BORDER};")
+        footer.setFixedHeight(28)
+        flay = QHBoxLayout(footer)
+        flay.setContentsMargins(14, 0, 14, 0)
+        flabel = QLabel("DEVELOPED BY WWW.3SVERSE.COM")
+        flabel.setStyleSheet(f"color: {MUTED}; font-size: 8pt; font-weight: 700; border: none;")
+        fver = QLabel(f"v{core.__version__}")
+        fver.setStyleSheet(f"color: {MUTED}; font-size: 8pt; border: none;")
+        flay.addStretch(1)
+        flay.addWidget(flabel)
+        flay.addStretch(1)
+        flay.addWidget(fver)
+        root.addWidget(footer)
+
     def _connect(self) -> None:
         self.ctl.fetchStarted.connect(self._on_fetch_started)
         self.ctl.metaReady.connect(self._on_meta)
@@ -405,10 +424,10 @@ class MainWindow(QMainWindow):
         self.view = view
         active = "QPushButton#active"
         self.grid_btn.setStyleSheet(
-            f"background: {ACCENT}; color: #FFFFFF;" if view == "grid" else ""
+            f"background: {ACCENT}; color: {BG};" if view == "grid" else ""
         )
         self.list_btn.setStyleSheet(
-            f"background: {ACCENT}; color: #FFFFFF;" if view == "list" else ""
+            f"background: {ACCENT}; color: {BG};" if view == "list" else ""
         )
         if self.items:
             self.render_cards()

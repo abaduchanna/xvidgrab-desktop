@@ -26,20 +26,21 @@ from PIL import Image, ImageTk
 
 import xgrab_core as core
 
-# X-style dark palette
-BG = "#0A0D12"
-SURFACE = "#10141B"
-CARD = "#161B24"
-CARD_SEL = "#12233A"
-BORDER = "#232B39"
-TEXT = "#E7E9EA"
-MUTED = "#8B98A5"
-ACCENT = "#1D9BF0"
-ACCENT_HOVER = "#1A8CD8"
-GREEN = "#00BA7C"
-RED = "#F4212E"
-AMBER = "#FFD400"
-THUMB_BG = "#0D1420"
+# 3SVerse brand palette (same tokens as License Studio / WiFi Transfer)
+BG = "#07060b"
+SURFACE = "#0d0c14"
+CARD = "#0d0c14"
+CARD_SEL = "#10242a"
+BORDER = "#232130"
+TEXT = "#f5f1e6"
+MUTED = "#9b97b3"
+ACCENT = "#6ee7ef"
+ACCENT_HOVER = "#9deff5"
+MAGENTA = "#e44bd7"
+GREEN = "#c7ef70"
+RED = "#ef6a52"
+AMBER = "#f5c518"
+THUMB_BG = "#12101a"
 
 GRID_CARD_W = 200
 GRID_THUMB_H = 112  # 16:9
@@ -133,6 +134,8 @@ class App(tk.Tk):
             head, text=f"v{core.__version__}", bg=BG, fg=MUTED,
             font=("Segoe UI", 9),
         ).pack(side=RIGHT, pady=(6, 0))
+
+        self._build_footer()
 
         # URL row --------------------------------------------------------
         urlrow = tk.Frame(self, bg=BG)
@@ -242,6 +245,19 @@ class App(tk.Tk):
 
         self.set_view(self.view)
 
+    def _build_footer(self) -> None:
+        """3SVerse brand footer (same standard as License Studio / WiFi
+        Transfer): developed-by centered, independent of the version label."""
+        bar = tk.Frame(self, bg=SURFACE, highlightbackground=BORDER,
+                        highlightthickness=1)
+        bar.pack(side=BOTTOM, fill=X)
+        tk.Frame(bar, bg=SURFACE, height=28).pack(fill=X)
+        tk.Label(bar, text="DEVELOPED BY WWW.3SVERSE.COM", bg=SURFACE,
+                 fg=MUTED, font=("Segoe UI", 8, "bold")
+                 ).place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(bar, text=f"v{core.__version__}", bg=SURFACE, fg=MUTED,
+                 font=("Consolas", 8)).place(relx=1.0, rely=0.5, anchor="e", x=-14)
+
     def _grid_cols(self, width: int) -> int:
         cols = max(1, (width - 12) // (GRID_CARD_W + 12))
         return min(cols, max(1, len(self.items)))
@@ -259,9 +275,9 @@ class App(tk.Tk):
         b = tk.Button(
             parent, text=text, command=cmd,
             bg=ACCENT if primary else SURFACE,
-            fg="#FFFFFF" if primary else TEXT,
+            fg=BG if primary else TEXT,
             activebackground=ACCENT_HOVER if primary else CARD,
-            activeforeground="#FFFFFF",
+            activeforeground=BG if primary else TEXT,
             disabledforeground=MUTED,
             relief="flat", bd=0, cursor="hand2",
             font=("Segoe UI", 9, "bold"),
@@ -346,9 +362,11 @@ class App(tk.Tk):
         self.view = view
         active, inactive = (ACCENT, SURFACE)
         self.view_grid_btn.configure(
-            bg=active if view == "grid" else inactive)
+            bg=active if view == "grid" else inactive,
+            fg=BG if view == "grid" else TEXT)
         self.view_list_btn.configure(
-            bg=active if view == "list" else inactive)
+            bg=active if view == "list" else inactive,
+            fg=BG if view == "list" else TEXT)
         self.render_cards()
         self._save_cfg()
 
