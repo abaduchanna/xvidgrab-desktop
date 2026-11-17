@@ -18,6 +18,7 @@ MIT licensed - see LICENSE.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -29,7 +30,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 APP_NAME = "XVidGrab Desktop"
 
 USER_AGENT = (
@@ -170,10 +171,30 @@ def _syndication_url(tweet_id: str) -> str:
     return f"{SYNDICATION_ENDPOINT}?{qs}"
 
 
-def _http_get(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return resp.read()
+def _http_get(url: str, retries: int = 3) -> bytes:
+    """GET *url* with automatic retries for flaky connections.
+
+    X's CDN occasionally drops chunked responses mid-transfer
+    (``http.client.IncompleteRead`` / ``RemoteDisconnected``), which used to
+    surface as a raw "Unexpected error" dialog.  Real HTTP status errors are
+    never retried - those are translated by the caller.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+            )
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return resp.read()
+        except urllib.error.HTTPError:
+            raise  # a real status code - caller turns it into a friendly error
+        except (http.client.HTTPException, OSError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(min(2 ** attempt, 5.0))
+    raise last_exc  # type: ignore[misc]
 
 
 def fetch_tweet(tweet_id: str) -> dict:
@@ -331,53 +352,216 @@ def pick_format(item: VideoItem, max_height: int | None = None) -> VideoFormat:
     return fmts[0]
 
 
+DOWNLOAD_RETRIES = 5          # extra attempts after the first one
+DOWNLOAD_BACKOFF_CAP = 15.0   # seconds between attempts (exponential, capped)
+DOWNLOAD_CHUNK_SIZE = 262144  # 256 KB reads keep big videos flowing
+
+
+class _RetryDownload(Exception):
+    """Internal: transfer ended early - caller should retry (and resume)."""
+
+
+class _CancelledDownload(Exception):
+    """Internal: the user pressed Cancel."""
+
+
+def _discard_part(part_path: str, meta_path: str) -> None:
+    for path in (part_path, meta_path):
+        if not path:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _probe_size(url: str) -> int | None:
+    """Best-effort full size of *url* via HEAD (None when unknown)."""
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD", headers={"User-Agent": USER_AGENT}
+        )
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            total = resp.headers.get("Content-Length")
+            return int(total) if total and total.isdigit() else None
+    except Exception:
+        return None
+
+
+def _download_attempt(
+    url: str,
+    dest_path: str,
+    part_path: str,
+    meta_path: str,
+    progress_cb,
+    cancel_event: threading.Event | None,
+    chunk_size: int,
+) -> None:
+    """One download pass; resumes a matching ``.part`` file.
+
+    Raises ``_RetryDownload`` when the transfer ends early so the caller can
+    retry - the bytes already on disk are kept and the next pass continues
+    from that offset via a ``Range`` request.
+    """
+    base = 0
+    resume = False
+    if os.path.exists(part_path) and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            if meta.get("url") == url:
+                base = os.path.getsize(part_path)
+                resume = base > 0
+        except (OSError, ValueError):
+            resume = False
+
+    headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
+    if resume:
+        headers["Range"] = f"bytes={base}-"
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 416 and resume:
+            # The .part file is already at (or past) the full size - this
+            # happens when a previous pass finished writing but crashed
+            # before the atomic rename.  Verify and finish it.
+            full = _probe_size(url)
+            if full == base:
+                os.replace(part_path, dest_path)
+                _discard_part("", meta_path)
+                return
+            _discard_part(part_path, meta_path)  # stale/corrupt part - start over
+            raise _RetryDownload() from exc
+        raise
+
+    with resp:
+        status = getattr(resp, "status", None) or 200
+        if resume and status != 206:
+            # Server ignored the Range header - restart from scratch.
+            resume = False
+            base = 0
+
+        hdr = resp.headers
+        expected = hdr.get("Content-Length")
+        expected = int(expected) if expected and expected.isdigit() else None
+        full_total: int | None = None
+        if status == 206:
+            m = re.search(r"/(\d+)\s*$", (hdr.get("Content-Range") or "").strip())
+            if m:
+                full_total = int(m.group(1))  # total size of the whole file
+        elif not resume and expected is not None:
+            full_total = expected
+
+        if status == 206 and full_total is not None and base >= full_total:
+            if base == full_total:
+                os.replace(part_path, dest_path)
+                _discard_part("", meta_path)
+                return
+            _discard_part(part_path, meta_path)  # corrupt part - start over
+            raise _RetryDownload()
+
+        if not resume:
+            # Tag the fresh .part with its stream so later passes (and later
+            # app runs) can resume it safely.
+            try:
+                with open(meta_path, "w", encoding="utf-8") as fh:
+                    json.dump({"url": url, "saved": time.time()}, fh)
+            except OSError:
+                pass
+
+        if progress_cb:
+            try:
+                progress_cb(base, full_total)
+            except Exception:
+                pass
+
+        mode = "ab" if resume else "wb"
+        with open(part_path, mode) as fh:
+            downloaded = 0
+            last_cb = 0.0
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _CancelledDownload()
+                try:
+                    chunk = resp.read(chunk_size)
+                except http.client.IncompleteRead as exc:
+                    # Server cut the chunked response short.  Keep whatever
+                    # arrived, then retry - the next pass resumes from here.
+                    if exc.partial:
+                        try:
+                            fh.write(exc.partial)
+                        except OSError:
+                            pass
+                    raise _RetryDownload() from exc
+                if not chunk:
+                    break
+                fh.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+                if progress_cb and now - last_cb >= 0.25:
+                    try:
+                        progress_cb(base + downloaded, full_total)
+                    except Exception:
+                        pass
+                    last_cb = now
+
+        done = base + downloaded
+        if full_total is not None and done < full_total:
+            raise _RetryDownload()  # short file - retry and resume
+        os.replace(part_path, dest_path)
+        _discard_part("", meta_path)
+
+
 def download_file(
     url: str,
     dest_path: str,
     progress_cb=None,
     cancel_event: threading.Event | None = None,
-    chunk_size: int = 65536,
+    chunk_size: int = DOWNLOAD_CHUNK_SIZE,
 ) -> str:
-    """Stream *url* to *dest_path* (atomic .part rename). Returns dest_path."""
-    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            total = resp.headers.get("Content-Length")
-            total = int(total) if total and total.isdigit() else None
-            part_path = dest_path + ".part"
-            downloaded = 0
-            last_cb = 0.0
+    """Stream *url* to *dest_path* (atomic ``.part`` rename).
 
-            with open(part_path, "wb") as fh:
-                while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        fh.close()
-                        try:
-                            os.remove(part_path)
-                        except OSError:
-                            pass
-                        raise XGrabError("Cancelled")
-                    chunk = resp.read(chunk_size)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    downloaded += len(chunk)
-                    now = time.monotonic()
-                    if progress_cb and (now - last_cb >= 0.25 or downloaded == total):
-                        try:
-                            progress_cb(downloaded, total)
-                        except Exception:
-                            pass
-                        last_cb = now
-            os.replace(part_path, dest_path)
-    except urllib.error.HTTPError as exc:
-        raise XGrabError(f"Download failed (HTTP {exc.code}).") from exc
-    except (urllib.error.URLError, OSError) as exc:
-        if isinstance(exc, XGrabError):
-            raise
-        raise XGrabError(f"Download failed: {exc}") from exc
-    return dest_path
+    Hardened against X's CDN dropping connections mid-transfer
+    (``IncompleteRead``, ``ChunkedEncodingError``-style cuts, resets):
+    up to ``DOWNLOAD_RETRIES`` extra attempts with exponential backoff,
+    byte-range resume from the ``.part`` file, ``Accept-Encoding: identity``
+    so byte counts match the wire, and a final size check against
+    Content-Length before the file is accepted.
+    Returns *dest_path*.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    part_path = dest_path + ".part"
+    meta_path = dest_path + ".part.meta"
+
+    attempts = DOWNLOAD_RETRIES + 1
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            _download_attempt(
+                url, dest_path, part_path, meta_path,
+                progress_cb, cancel_event, chunk_size,
+            )
+            return dest_path
+        except _CancelledDownload:
+            # Keep .part + meta so the next click resumes where it stopped.
+            raise XGrabError("Cancelled")
+        except urllib.error.HTTPError as exc:
+            raise XGrabError(f"Download failed (HTTP {exc.code}).") from exc
+        except _RetryDownload as exc:
+            last_exc = exc
+        except (http.client.HTTPException, OSError) as exc:
+            last_exc = exc
+        if attempt < attempts - 1:
+            delay = min(2 ** attempt, DOWNLOAD_BACKOFF_CAP)
+            if cancel_event is not None and cancel_event.wait(delay):
+                raise XGrabError("Cancelled")
+    raise XGrabError(
+        f"Download kept failing after {attempts} attempts "
+        f"({last_exc}). Your connection to X's CDN kept dropping - "
+        "try again and it resumes from where it stopped."
+    )
 
 
 # --------------------------------------------------------------------------
