@@ -4,7 +4,7 @@
   "version": "1.3.0",
   "description": "One-click video & GIF downloader for X (Twitter). Free and open source, 100% local — no accounts, no limits, no tracking.",
   "author": "3SVerse",
-  "homepage_url": "https://github.com/abaduchanna/xvidgrab",
+  "homepage_url": "https://github.com/abaduchanna/xvidgrab-desktop",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

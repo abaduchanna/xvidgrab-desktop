@@ -7,7 +7,7 @@
 
 ---
 
-**XVidGrab Desktop** is part of the [3SVerse](https://3sverse.com) suite — software, systems & operations. More free tools at [3sverse.com](https://3sverse.com). It is the desktop companion of the [XVidGrab browser extension](https://github.com/abaduchanna/xvidgrab).
+**XVidGrab Desktop** is part of the [3SVerse](https://3sverse.com) suite — software, systems & operations. More free tools at [3sverse.com](https://3sverse.com). The [browser extension](extension/) lives in this same repo now, under `extension/` — both the desktop app and the extension ship together from every [Release](../../releases/latest).
 
 **XVidGrab Desktop** is a free, open-source **GUI video downloader for X
 (formerly Twitter)**. Paste a post link and it shows **every video on that
