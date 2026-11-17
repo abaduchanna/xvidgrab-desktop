@@ -364,7 +364,7 @@ def _dump_debug_json(tweet_id: str, data: dict) -> str | None:
     on any failure (debug dumping must never break a real fetch).
     """
     try:
-        debug_dir = os.path.join(os.path.expanduser("~"), ".xvidgrab-desktop-debug")
+        debug_dir = os.path.join(default_download_dir(), "debug")
         os.makedirs(debug_dir, exist_ok=True)
         path = os.path.join(debug_dir, f"{tweet_id}.json")
         with open(path, "w", encoding="utf-8") as f:
