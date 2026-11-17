@@ -19,8 +19,8 @@ Two polished interfaces are included, both with **list view and grid view**:
 
 | Build | GUI toolkit | File |
 |---|---|---|
-| `XVidGrab-Desktop.exe` | Tkinter (smaller download) | `xvidgrab_desktop.py` |
-| `XVidGrab-Desktop-Qt.exe` | PySide6 / Qt | `xvidgrab_desktop_qt.py` |
+| `XVidGrab-Desktop-Qt.exe` | PySide6 / Qt (recommended) | `xvidgrab_desktop_qt.py` |
+| `XVidGrab-Desktop.exe` | Tkinter (lightweight alternative) | `xvidgrab_desktop.py` |
 
 No accounts, no API keys, no cookies, no telemetry. Video discovery uses the
 same public embed data source X serves to every website on the internet.
@@ -70,8 +70,8 @@ same public embed data source X serves to every website on the internet.
 
 1. Run the app:
 
+       python xvidgrab_desktop_qt.py     (Qt build, recommended)
        python xvidgrab_desktop.py        (Tkinter build)
-       python xvidgrab_desktop_qt.py     (Qt build)
 
 2. Copy an X post link — for example
    `https://x.com/SpaceX/status/2122355344576037338` — and paste it into the
