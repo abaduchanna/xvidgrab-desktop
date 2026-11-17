@@ -1,0 +1,5 @@
+# XVidGrab Desktop: thumbnails (both GUIs) + the PySide6 GUI
+# Developed by www.3SVerse.com
+
+Pillow>=10.0.0
+PySide6>=6.7.0
