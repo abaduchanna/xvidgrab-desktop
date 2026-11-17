@@ -105,24 +105,83 @@ jobs:
           path: dist/${{ matrix.exe }}.exe
           if-no-files-found: error
 
-  release:
-    needs: build
+  package_extension:
+    needs: test
     runs-on: ubuntu-latest
     steps:
-      - name: Download all EXEs
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Version consistency check
+        run: |
+          cd extension
+          V1=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
+          V2=$(python3 -c "import json;print(json.load(open('manifest.firefox.json'))['version'])")
+          echo "chrome=$V1 firefox=$V2"
+          [ "$V1" = "$V2" ] || { echo "manifest versions differ"; exit 1; }
+
+      - name: Validate JS syntax
+        run: |
+          cd extension
+          node --check background.js
+          node --check content/main.js
+          node --check content/sniffer.js
+          node --check content/sniff-parse.js
+          node --check popup/popup.js
+
+      - name: Package Chromium (MV3) zip
+        run: |
+          mkdir -p dist stage_chrome stage_firefox
+          cd extension
+          cp -r manifest.json background.js content popup icons "$GITHUB_WORKSPACE/stage_chrome/"
+          ( cd "$GITHUB_WORKSPACE/stage_chrome" && zip -q -r "$GITHUB_WORKSPACE/dist/XVidGrab_Extension_Chrome.zip" . )
+
+      - name: Package Firefox (MV2) xpi
+        run: |
+          cd extension
+          cp -r background.js content popup icons "$GITHUB_WORKSPACE/stage_firefox/"
+          cp manifest.firefox.json "$GITHUB_WORKSPACE/stage_firefox/manifest.json"
+          ( cd "$GITHUB_WORKSPACE/stage_firefox" && zip -q -r "$GITHUB_WORKSPACE/dist/XVidGrab_Extension_Firefox.xpi" . )
+
+      - name: Verify packages
+        run: |
+          cd dist
+          for f in XVidGrab_Extension_Chrome.zip XVidGrab_Extension_Firefox.xpi; do
+            unzip -l "$f" | grep -q "manifest.json" || { echo "$f missing manifest"; exit 1; }
+            unzip -l "$f" | grep -q "background.js" || { echo "$f missing background.js"; exit 1; }
+          done
+          unzip -p XVidGrab_Extension_Chrome.zip manifest.json | grep -q '"manifest_version": 3' || { echo "chrome zip is not MV3"; exit 1; }
+          unzip -p XVidGrab_Extension_Firefox.xpi manifest.json | grep -q '"manifest_version": 2' || { echo "firefox xpi is not MV2"; exit 1; }
+          echo "packages OK"
+
+      - name: Upload extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          retention-days: 1
+          name: extension-packages
+          path: |
+            dist/XVidGrab_Extension_Chrome.zip
+            dist/XVidGrab_Extension_Firefox.xpi
+          if-no-files-found: error
+
+  release:
+    needs: [build, package_extension]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all EXEs and extension packages
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: List downloaded EXEs
+      - name: List downloaded files
         id: list_artifacts
         run: |
           ls -la dist/
           {
             echo "files<<EOF"
-            for f in dist/*.exe; do
-              echo "- $(basename "$f")"
+            for f in dist/*.exe dist/*.zip dist/*.xpi; do
+              [ -f "$f" ] && echo "- $(basename "$f")"
             done
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -136,7 +195,18 @@ jobs:
             Automated build #${{ github.run_number }}
             Commit: ${{ github.sha }}
 
+            Desktop app (Windows):
+            - XVidGrab-Desktop-Qt.exe (recommended)
+            - XVidGrab-Desktop.exe
+
+            Browser extension:
+            - XVidGrab_Extension_Chrome.zip — unzip, then chrome://extensions (or edge://extensions etc.) > enable Developer mode > Load unpacked > select the unzipped folder
+            - XVidGrab_Extension_Firefox.xpi — install directly (drag into about:addons, or install from file)
+
             Artifacts:
             ${{ steps.list_artifacts.outputs.files }}
-          files: dist/*.exe
+          files: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.xpi
           make_latest: true
