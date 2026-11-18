@@ -275,6 +275,55 @@ if _QT_OK:
             )
         ]
 
+    def _dump_resolve_debug(page, tweet_id: str, loaded: bool, found_urls: list) -> None:
+        """Save what the authenticated-browser resolve actually saw when it
+        comes back empty - page title, a text snippet, and whatever video
+        URLs (if any) the interceptor did catch. Diagnosing this blind a
+        second time isn't useful; this gives something concrete to look at
+        instead of guessing again."""
+        try:
+            info = {"title": "", "snippet": ""}
+            inner_loop = QEventLoop()
+
+            def on_result(value) -> None:
+                if isinstance(value, dict):
+                    info["title"] = str(value.get("title") or "")
+                    info["snippet"] = str(value.get("snippet") or "")[:600]
+                inner_loop.quit()
+
+            def parse_and_call(raw) -> None:
+                try:
+                    on_result(json.loads(raw) if isinstance(raw, str) else {})
+                except Exception:
+                    on_result({})
+
+            page.runJavaScript(iife(
+                "return JSON.stringify({"
+                "  title: document.title || '',"
+                "  snippet: (document.body ? document.body.innerText : '').slice(0, 600)"
+                "});"
+            ), parse_and_call)
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(inner_loop.quit)
+            timer.start(2000)
+            inner_loop.exec()
+            timer.stop()
+
+            debug_dir = os.path.join(core.default_download_dir(), "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            path = os.path.join(debug_dir, f"{tweet_id}_authresolve.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"tweet_id: {tweet_id}\n")
+                f.write(f"page_loaded: {loaded}\n")
+                f.write(f"video_urls_captured: {len(found_urls)}\n")
+                for u in found_urls:
+                    f.write(f"  - {u}\n")
+                f.write(f"page_title: {info['title']}\n")
+                f.write(f"page_text_snippet:\n{info['snippet']}\n")
+        except Exception:
+            pass  # diagnostics must never break the actual resolve
+
     def resolve_via_authenticated_browser(tweet_id: str, timeout: float = 12.0):
         """Load the post in the logged-in browser session and watch its
         real network traffic for video CDN URLs. MUST be called from the
@@ -308,13 +357,29 @@ if _QT_OK:
         timer.stop()
 
         if state["loaded"]:
-            # X often only requests the real video segments once playback
-            # starts, not just on page load - nudge it so those requests
-            # actually fire, then give them a moment to show up.
+            # A sensitive/age-restricted post shows an interstitial ("this
+            # post might include sensitive content... View") that blocks the
+            # video element from ever mounting until it's clicked through -
+            # exactly the posts this whole fallback exists for. Click any
+            # such gate first, THEN nudge playback once it's had a moment to
+            # reveal the real post underneath - X often only requests the
+            # real video segments once playback starts, not just on load.
             try:
                 page.runJavaScript(iife(
-                    "var v=document.querySelector('video'); "
-                    "if (v) { v.muted = true; v.play().catch(function(){}); }"
+                    "function clickGate(){"
+                    "  var nodes = document.querySelectorAll(\"div[role='button'],span\");"
+                    "  for (var i = 0; i < nodes.length; i++) {"
+                    "    var t = (nodes[i].innerText || '').trim().toLowerCase();"
+                    "    if (t === 'view' || t === 'view profile photo') { nodes[i].click(); return true; }"
+                    "  }"
+                    "  return false;"
+                    "}"
+                    "clickGate();"
+                    "setTimeout(function(){"
+                    "  clickGate();"
+                    "  var v = document.querySelector('video');"
+                    "  if (v) { v.muted = true; v.play().catch(function(){}); }"
+                    "}, 700);"
                 ))
             except Exception:
                 pass
@@ -322,15 +387,18 @@ if _QT_OK:
             settle_timer = QTimer()
             settle_timer.setSingleShot(True)
             settle_timer.timeout.connect(settle.quit)
-            settle_timer.start(3000)
+            settle_timer.start(4000)
             settle.exec()
 
         interceptor.target_tweet_id = ""  # stop recording before teardown
         urls = list(dict.fromkeys(interceptor.found))  # de-dup, keep order
+        items = _video_items_from_urls(tweet_id, urls) if state["loaded"] else []
+        if not items:
+            _dump_resolve_debug(page, tweet_id, state["loaded"], urls)
         page.deleteLater()
         if not state["loaded"]:
             return None
-        return _video_items_from_urls(tweet_id, urls)
+        return items
 
     class SearchWebViewDialog(QDialog):
         """In-app browser window: load, log in (here!), scroll, harvest."""
