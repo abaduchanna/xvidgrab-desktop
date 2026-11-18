@@ -34,6 +34,7 @@ __all__ = [
     "clean_user_agent",
     "parse_harvest",
     "merge_harvest",
+    "resolve_via_authenticated_browser",
     "WEBVIEW_PROFILE_DIR",
 ]
 
@@ -142,7 +143,7 @@ def core_hex(name: str) -> str:
 # --------------------------------------------------------------------------
 
 try:  # pragma: no cover - exercised implicitly by the import machinery
-    from PySide6.QtCore import QTimer, QUrl
+    from PySide6.QtCore import QEventLoop, QObject, QTimer, QUrl
     from PySide6.QtWidgets import (
         QApplication,
         QDialog,
@@ -151,7 +152,11 @@ try:  # pragma: no cover - exercised implicitly by the import machinery
         QPushButton,
         QVBoxLayout,
     )
-    from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+    from PySide6.QtWebEngineCore import (
+        QWebEnginePage,
+        QWebEngineProfile,
+        QWebEngineUrlRequestInterceptor,
+    )
     from PySide6.QtWebEngineWidgets import QWebEngineView
 
     _QT_OK = True
@@ -181,6 +186,143 @@ if _QT_OK:
             prof.setHttpUserAgent(clean_user_agent(prof.httpUserAgent()))
             _shared_profile = prof
         return _shared_profile
+
+    # ----------------------------------------------------------------
+    # Authenticated resolve: recover a video the public syndication API
+    # refuses (TombstoneError - age-restricted/sensitive/limited) by
+    # loading the post in the app's own logged-in browser session and
+    # watching for its real video CDN requests, the way a human browsing
+    # the page would see them load. The public API has no login at all,
+    # so this is the only way this app can ever reach that content.
+    # ----------------------------------------------------------------
+    _VIDEO_CDN_RE = re.compile(
+        r"https://video\.twimg\.com/[^\s\"']+\.(?:mp4|m3u8)(?:\?[^\s\"']*)?"
+    )
+
+    class _VideoCaptureInterceptor(QWebEngineUrlRequestInterceptor):
+        """Watches every request on the shared profile, but only records
+        the ones whose originating page is the one resolve just navigated
+        to - a search dialog's own scroll traffic on the same shared
+        profile passes through untouched and unrecorded, since its
+        requests carry a different firstPartyUrl."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.target_page_url = ""
+            self.found: list[str] = []
+
+        def interceptRequest(self, info) -> None:  # noqa: N802 - Qt override
+            try:
+                if not self.target_page_url:
+                    return
+                if info.firstPartyUrl().toString() != self.target_page_url:
+                    return
+                url = info.requestUrl().toString()
+                if _VIDEO_CDN_RE.match(url):
+                    self.found.append(url)
+            except Exception:
+                pass  # must never raise - that can take the page load down with it
+
+    _capture_interceptor = None
+
+    def _ensure_interceptor():
+        global _capture_interceptor
+        if _capture_interceptor is None:
+            _capture_interceptor = _VideoCaptureInterceptor()
+            shared_profile().setUrlRequestInterceptor(_capture_interceptor)
+        return _capture_interceptor
+
+    def _video_items_from_urls(tweet_id: str, urls: list[str]) -> list:
+        mp4s = [u for u in urls if u.endswith(".mp4") or ".mp4?" in u]
+        fmts = []
+        for u in mp4s:
+            w, h = core._dims_from_url(u)
+            fmts.append(
+                core.VideoFormat(
+                    content_type="video/mp4", width=w, height=h, bitrate=0, url=u
+                )
+            )
+        by_res = {}
+        for f in fmts:
+            res = (f.width, f.height)
+            if res not in by_res:  # first seen at each resolution wins
+                by_res[res] = f
+        fmts = sorted(
+            by_res.values(), key=lambda f: (f.height * f.width), reverse=True
+        )
+        if not fmts:
+            return []
+        return [
+            core.VideoItem(
+                tweet_id=tweet_id,
+                index=1,
+                total=1,
+                uploader="x",
+                text="",
+                duration_ms=None,
+                media_type="video",
+                thumbnail_url="",
+                formats=fmts,
+                webpage_url=f"https://x.com/i/status/{tweet_id}",
+            )
+        ]
+
+    def resolve_via_authenticated_browser(tweet_id: str, timeout: float = 12.0):
+        """Load the post in the logged-in browser session and watch its
+        real network traffic for video CDN URLs. MUST be called from the
+        GUI thread - QtWebEngine requires it; a background worker reaches
+        this through a Qt signal/blocking-queued-connection bridge, same
+        pattern as every other GUI-thread handoff in this app. Returns
+        list[core.VideoItem] (possibly empty) or None if the page itself
+        never loaded (offline, blocked, etc).
+        """
+        interceptor = _ensure_interceptor()
+        page = QWebEnginePage(shared_profile())
+        url = f"https://x.com/i/status/{tweet_id}"
+        interceptor.target_page_url = url
+        interceptor.found = []
+
+        state = {"loaded": False}
+        loop = QEventLoop()
+
+        def on_load(ok) -> None:
+            state["loaded"] = True
+            loop.quit()
+
+        page.loadFinished.connect(on_load)
+        page.setUrl(QUrl(url))
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        timer.start(int(timeout * 1000))
+        loop.exec()
+        timer.stop()
+
+        if state["loaded"]:
+            # X often only requests the real video segments once playback
+            # starts, not just on page load - nudge it so those requests
+            # actually fire, then give them a moment to show up.
+            try:
+                page.runJavaScript(iife(
+                    "var v=document.querySelector('video'); "
+                    "if (v) { v.muted = true; v.play().catch(function(){}); }"
+                ))
+            except Exception:
+                pass
+            settle = QEventLoop()
+            settle_timer = QTimer()
+            settle_timer.setSingleShot(True)
+            settle_timer.timeout.connect(settle.quit)
+            settle_timer.start(3000)
+            settle.exec()
+
+        interceptor.target_page_url = ""  # stop recording before teardown
+        urls = list(dict.fromkeys(interceptor.found))  # de-dup, keep order
+        page.deleteLater()
+        if not state["loaded"]:
+            return None
+        return _video_items_from_urls(tweet_id, urls)
 
     class SearchWebViewDialog(QDialog):
         """In-app browser window: load, log in (here!), scroll, harvest."""
@@ -484,3 +626,6 @@ else:  # no Qt / no QtWebEngine - keep the module importable anyway
             "The in-app browser (PySide6 QtWebEngine) is not available in "
             "this build."
         )
+
+    def resolve_via_authenticated_browser(*_args, **_kwargs):  # pragma: no cover
+        return None

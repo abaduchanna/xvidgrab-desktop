@@ -235,6 +235,34 @@ class TestFetchTweetTombstone:
             with pytest.raises(core.XGrabError, match="age-restricted"):
                 core.fetch_tweet("123")
 
+    def test_tombstone_is_specifically_a_tombstone_error(self):
+        raw = json.dumps({"__typename": "TweetTombstone", "tombstone": {}}).encode()
+        with mock.patch.object(core, "_http_get", return_value=raw):
+            with pytest.raises(core.TombstoneError):
+                core.fetch_tweet("123")
+
+    def test_resolve_fallback_used_on_tombstone(self):
+        raw = json.dumps({"__typename": "TweetTombstone", "tombstone": {}}).encode()
+        fake_item = object()  # fetch_videos just needs a truthy list back
+
+        def fallback(tweet_id):
+            assert tweet_id == "123"
+            return [fake_item]
+
+        with mock.patch.object(core, "_http_get", return_value=raw):
+            items = core.fetch_videos(
+                "https://x.com/u/status/123", resolve_fallback=fallback
+            )
+        assert items == [fake_item]
+
+    def test_resolve_fallback_empty_still_raises_tombstone(self):
+        raw = json.dumps({"__typename": "TweetTombstone", "tombstone": {}}).encode()
+        with mock.patch.object(core, "_http_get", return_value=raw):
+            with pytest.raises(core.TombstoneError):
+                core.fetch_videos(
+                    "https://x.com/u/status/123", resolve_fallback=lambda tid: []
+                )
+
 
 # ---------------------------------------------------------------- selection
 class TestPickFormat:

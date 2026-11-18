@@ -86,6 +86,14 @@ class RateLimitError(XGrabError):
     giving up on it."""
 
 
+class TombstoneError(XGrabError):
+    """X's public (no-login) syndication endpoint refuses to serve this
+    post - age-restricted/sensitive content, or a suspended/limited
+    author. A logged-in browser can still see it. Distinct from a plain
+    XGrabError so callers with an authenticated fallback (the in-app
+    webview) can catch just this case."""
+
+
 # --------------------------------------------------------------------------
 # Data model
 # --------------------------------------------------------------------------
@@ -275,7 +283,7 @@ def fetch_tweet(tweet_id: str) -> dict:
         # times this is retried; a logged-in browser session (which the
         # in-app search browser has) can still SEE the post, which is why
         # this looks like a contradiction from the scroll/resolve flow.
-        raise XGrabError(
+        raise TombstoneError(
             "This post is age-restricted, sensitive, or otherwise limited - "
             "X won't serve it through the public (no-login) API this app "
             "uses, even though a logged-in browser can see it."
@@ -388,14 +396,29 @@ def _dump_debug_json(tweet_id: str, data: dict) -> str | None:
         return None
 
 
-def fetch_videos(url: str) -> list[VideoItem]:
-    """Fetch every video of one canonical post URL. Raises XGrabError."""
+def fetch_videos(url: str, resolve_fallback=None) -> list[VideoItem]:
+    """Fetch every video of one canonical post URL. Raises XGrabError.
+
+    *resolve_fallback*, if given, is ``callable(tweet_id) -> list[VideoItem]
+    | None``. It's tried only when the public syndication endpoint reports
+    a TombstoneError (age-restricted/sensitive/limited post) - the GUI
+    layer can wire this to the authenticated in-app browser session, which
+    can still see what the public API can't. A core-only caller (no GUI)
+    simply omits it and gets the plain TombstoneError.
+    """
     m = _STATUS_RE.search(url or "")
     if not m:
         raise XGrabError("That does not look like an X post link.")
     tweet_id = m.group(2)
-    data = fetch_tweet(tweet_id)
-    items = parse_videos(data, tweet_id)
+    try:
+        data = fetch_tweet(tweet_id)
+        items = parse_videos(data, tweet_id)
+    except TombstoneError:
+        if resolve_fallback:
+            items = resolve_fallback(tweet_id) or []
+            if items:
+                return items
+        raise
     if not items:
         dumped = _dump_debug_json(tweet_id, data)
         msg = "No videos found in that post - it may contain only photos."
@@ -410,6 +433,7 @@ def fetch_videos_batch(
     on_item=None,
     on_error=None,
     stop_event=None,
+    resolve_fallback=None,
 ) -> tuple[int, int]:
     """Fetch every link in *urls*, robust to a large batch tripping the
     syndication endpoint's rate limit.
@@ -448,7 +472,7 @@ def fetch_videos_batch(
             if i > 0:
                 time.sleep(delay)
             try:
-                items = fetch_videos(u)
+                items = fetch_videos(u, resolve_fallback=resolve_fallback)
                 if on_item:
                     on_item(items)
                 ok_count += 1

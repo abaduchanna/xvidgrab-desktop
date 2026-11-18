@@ -152,6 +152,7 @@ def resolve_ids(
     progress=None,
     on_items=None,
     stop_event: threading.Event | None = None,
+    resolve_fallback=None,
 ) -> list[core.VideoItem]:
     """Turn collected tweet ids into VideoItems via the syndication engine.
 
@@ -162,6 +163,13 @@ def resolve_ids(
     give-up logic this used to have of its own. Emits *on_items* in chunks
     of :data:`RESOLVE_CHUNK` videos so the GUI can render results while the
     rest resolve.
+
+    *resolve_fallback*, passed straight through to fetch_videos_batch, is
+    tried for an id the public API refuses (TombstoneError) - lets the
+    authenticated in-app browser recover a video the public endpoint can't
+    see. Search results are exactly where this matters most: the scroll
+    collector can find a post whose video only a logged-in session can
+    reach.
     """
     progress = progress or (lambda msg: None)
     on_items = on_items or (lambda chunk: None)
@@ -189,7 +197,8 @@ def resolve_ids(
     # discarded, only the numeric id is used).
     urls = [f"https://x.com/i/status/{tid}" for tid in ids]
     core.fetch_videos_batch(
-        urls, on_item=_on_item, on_error=_on_error, stop_event=stop_event
+        urls, on_item=_on_item, on_error=_on_error, stop_event=stop_event,
+        resolve_fallback=resolve_fallback,
     )
     if chunk:
         on_items(list(chunk))
@@ -220,11 +229,13 @@ class SearchCollector:
         progress=None,
         on_items=None,
         stop_event: threading.Event | None = None,
+        resolve_fallback=None,
     ) -> None:
         self.url = url
         self.progress = progress or (lambda msg: None)
         self.on_items = on_items or (lambda items: None)
         self.stop_event = stop_event or threading.Event()
+        self.resolve_fallback = resolve_fallback
         # id -> {"user": str, "text": str} ; insertion order preserved
         self.found: dict[str, dict] = {}
 
@@ -377,6 +388,7 @@ class SearchCollector:
                     progress=self.progress,
                     on_items=self.on_items,
                     stop_event=self.stop_event,
+                    resolve_fallback=self.resolve_fallback,
                 )
 
             self.progress("Scrolling the page - collecting videos...")
@@ -463,4 +475,5 @@ class SearchCollector:
             progress=self.progress,
             on_items=self.on_items,
             stop_event=self.stop_event,
+            resolve_fallback=self.resolve_fallback,
         )

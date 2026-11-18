@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QMetaObject, QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -148,6 +148,36 @@ class Controller(QObject):
     itemDone = Signal(tuple, str)                 # key, path
     itemFail = Signal(tuple, str)                 # key, error
     allDone = Signal()
+
+    # cross-thread bridge for the authenticated-browser resolve fallback -
+    # QtWebEngine must run on the GUI thread, but batch-resolve runs on a
+    # worker thread. Args/result go through instance attributes (not Qt's
+    # argument marshaling) - same pattern already used elsewhere in this
+    # app for a worker thread calling back into the GUI thread.
+    _browser_resolve_tweet_id = ""
+    _browser_resolve_result = None
+
+    @Slot()
+    def _resolveViaBrowserSlot(self) -> None:
+        try:
+            self._browser_resolve_result = xweb.resolve_via_authenticated_browser(
+                self._browser_resolve_tweet_id
+            )
+        except Exception:
+            self._browser_resolve_result = None
+
+    def resolve_via_browser_sync(self, tweet_id: str):
+        """Callable from any thread. Blocks the CALLING thread (not the
+        GUI thread) until the authenticated browser has tried to resolve
+        *tweet_id*. Returns list[core.VideoItem] or None."""
+        if not xweb.webengine_available():
+            return None
+        self._browser_resolve_tweet_id = tweet_id
+        self._browser_resolve_result = None
+        QMetaObject.invokeMethod(
+            self, "_resolveViaBrowserSlot", Qt.BlockingQueuedConnection
+        )
+        return self._browser_resolve_result
 
 
 class MainWindow(QMainWindow):
@@ -388,6 +418,7 @@ class MainWindow(QMainWindow):
                 on_item=lambda items: self.ctl.metaReady.emit(items),
                 on_error=on_error,
                 stop_event=self.fetch_stop,
+                resolve_fallback=self.ctl.resolve_via_browser_sync,
             )
             self._last_fetch_ok = ok_count
             self._last_fetch_fail = fail_count
@@ -507,6 +538,7 @@ class MainWindow(QMainWindow):
                         progress=lambda m: self.ctl.fetchStarted.emit(m),
                         on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
                         stop_event=self.fetch_stop,
+                        resolve_fallback=self.ctl.resolve_via_browser_sync,
                     )
                 except Exception as exc:  # defensive
                     self.ctl.fetchError.emit(f"Unexpected error: {exc}")
