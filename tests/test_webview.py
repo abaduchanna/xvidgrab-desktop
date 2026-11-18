@@ -134,6 +134,81 @@ class TestModuleContract:
         assert "XVidGrab-WebViewProfile" in xweb.WEBVIEW_PROFILE_DIR
 
 
+# --------------------------------------- authenticated-resolve interceptor
+class TestVideoCaptureInterceptor:
+    """x.com/i/status/<id> (the only form resolve can navigate to without
+    already knowing the author's handle) redirects to the canonical
+    x.com/<user>/status/<id> once it resolves - the page's real, final URL
+    never equals what resolve originally set. Matching must tolerate that
+    redirect (substring-match on the tweet id) or it silently records
+    nothing, ever, even on a page that loaded and played correctly."""
+
+    def _interceptor(self):
+        if not xweb.webengine_available():
+            pytest.skip("QtWebEngine not available in this environment")
+        return xweb._VideoCaptureInterceptor()
+
+    class _FakeUrl:
+        def __init__(self, s):
+            self._s = s
+
+        def toString(self):
+            return self._s
+
+    class _FakeInfo:
+        def __init__(self, first_party, request_url):
+            self._fp = first_party
+            self._ru = request_url
+
+        def firstPartyUrl(self):
+            return TestVideoCaptureInterceptor._FakeUrl(self._fp)
+
+        def requestUrl(self):
+            return TestVideoCaptureInterceptor._FakeUrl(self._ru)
+
+    def test_captures_after_redirect_to_canonical_url(self):
+        itc = self._interceptor()
+        itc.target_tweet_id = "12345"
+        info = self._FakeInfo(
+            first_party="https://x.com/someuser/status/12345",
+            request_url="https://video.twimg.com/ext_tw_video/12345/pu/vid/avc1/1280x720/x.mp4",
+        )
+        itc.interceptRequest(info)
+        assert itc.found == [
+            "https://video.twimg.com/ext_tw_video/12345/pu/vid/avc1/1280x720/x.mp4"
+        ]
+
+    def test_ignores_other_pages_on_same_shared_profile(self):
+        itc = self._interceptor()
+        itc.target_tweet_id = "12345"
+        info = self._FakeInfo(
+            first_party="https://x.com/search?q=something",
+            request_url="https://video.twimg.com/ext_tw_video/99999/pu/vid/avc1/1280x720/x.mp4",
+        )
+        itc.interceptRequest(info)
+        assert itc.found == []
+
+    def test_no_target_records_nothing(self):
+        itc = self._interceptor()
+        itc.target_tweet_id = ""
+        info = self._FakeInfo(
+            first_party="https://x.com/someuser/status/12345",
+            request_url="https://video.twimg.com/ext_tw_video/12345/pu/vid/avc1/1280x720/x.mp4",
+        )
+        itc.interceptRequest(info)
+        assert itc.found == []
+
+    def test_ignores_non_video_requests(self):
+        itc = self._interceptor()
+        itc.target_tweet_id = "12345"
+        info = self._FakeInfo(
+            first_party="https://x.com/someuser/status/12345",
+            request_url="https://pbs.twimg.com/profile_images/1/avatar.jpg",
+        )
+        itc.interceptRequest(info)
+        assert itc.found == []
+
+
 # ---------------------------------------------------------- JS wrapping
 class TestIife:
     """runJavaScript evaluates a classic script - a top-level ``return``

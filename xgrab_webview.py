@@ -204,18 +204,26 @@ if _QT_OK:
         the ones whose originating page is the one resolve just navigated
         to - a search dialog's own scroll traffic on the same shared
         profile passes through untouched and unrecorded, since its
-        requests carry a different firstPartyUrl."""
+        requests carry a different firstPartyUrl.
+
+        Matched by tweet id being present in firstPartyUrl, NOT an exact
+        URL match: x.com/i/status/<id> (what we navigate to - the only
+        form that works without already knowing the author's handle)
+        redirects to the canonical x.com/<user>/status/<id> once it
+        resolves, so the page's real, final URL never equals the one we
+        set. An exact match would silently record nothing, ever, even
+        on a page that loaded and played the video correctly."""
 
         def __init__(self) -> None:
             super().__init__()
-            self.target_page_url = ""
+            self.target_tweet_id = ""
             self.found: list[str] = []
 
         def interceptRequest(self, info) -> None:  # noqa: N802 - Qt override
             try:
-                if not self.target_page_url:
+                if not self.target_tweet_id:
                     return
-                if info.firstPartyUrl().toString() != self.target_page_url:
+                if self.target_tweet_id not in info.firstPartyUrl().toString():
                     return
                 url = info.requestUrl().toString()
                 if _VIDEO_CDN_RE.match(url):
@@ -279,7 +287,7 @@ if _QT_OK:
         interceptor = _ensure_interceptor()
         page = QWebEnginePage(shared_profile())
         url = f"https://x.com/i/status/{tweet_id}"
-        interceptor.target_page_url = url
+        interceptor.target_tweet_id = tweet_id
         interceptor.found = []
 
         state = {"loaded": False}
@@ -317,7 +325,7 @@ if _QT_OK:
             settle_timer.start(3000)
             settle.exec()
 
-        interceptor.target_page_url = ""  # stop recording before teardown
+        interceptor.target_tweet_id = ""  # stop recording before teardown
         urls = list(dict.fromkeys(interceptor.found))  # de-dup, keep order
         page.deleteLater()
         if not state["loaded"]:
