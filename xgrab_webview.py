@@ -35,6 +35,7 @@ __all__ = [
     "parse_harvest",
     "merge_harvest",
     "resolve_via_authenticated_browser",
+    "shutdown_resolve_view",
     "WEBVIEW_PROFILE_DIR",
 ]
 
@@ -324,6 +325,61 @@ if _QT_OK:
         except Exception:
             pass  # diagnostics must never break the actual resolve
 
+    _resolve_view = None
+    _resolve_page = None
+
+    def _ensure_resolve_view():
+        """One hidden, off-screen QWebEngineView reused for every resolve,
+        instead of a fresh view+page per tweet. Two reasons: (1) repeatedly
+        creating/tearing down QWebEngineView/Page instances (each backed by
+        its own QtWebEngine child process) is slow across a big batch, and
+        (2) a deleteLater()'d view/page can outlive app.exec() returning if
+        the event loop stops before the deferred deletion actually runs,
+        leaving its QtWebEngine child process orphaned in the background
+        after the main window closes. A single long-lived instance, torn
+        down explicitly via shutdown_resolve_view() on app exit, avoids
+        both.
+        """
+        global _resolve_view, _resolve_page
+        if _resolve_view is None:
+            _resolve_page = QWebEnginePage(shared_profile())
+            # A bare QWebEnginePage with no attached view has no real
+            # viewport - X (like most modern sites) only mounts the actual
+            # video player when its element is "visible"
+            # (IntersectionObserver), which never fires with no viewport at
+            # all. A real, sized QWebEngineView gives it one; moving the
+            # view far off-screen before showing it keeps it genuinely
+            # invisible to the user while still getting a real native
+            # window and a working compositor/viewport underneath.
+            _resolve_view = QWebEngineView()
+            _resolve_view.setPage(_resolve_page)
+            _resolve_view.resize(1000, 1400)
+            _resolve_view.move(-32000, -32000)
+            _resolve_view.show()
+        return _resolve_view, _resolve_page
+
+    def shutdown_resolve_view():
+        """Explicitly tear down the reused resolve view/page. Call this
+        from the app's aboutToQuit (or equivalent shutdown path) - relying
+        on Qt/Python object teardown alone at process exit is exactly what
+        leaves a QtWebEngine child process running in the background after
+        the main window closes."""
+        global _resolve_view, _resolve_page
+        if _resolve_view is not None:
+            try:
+                _resolve_view.setPage(None)
+                _resolve_view.close()
+                _resolve_view.deleteLater()
+            except Exception:
+                pass
+            _resolve_view = None
+        if _resolve_page is not None:
+            try:
+                _resolve_page.deleteLater()
+            except Exception:
+                pass
+            _resolve_page = None
+
     def resolve_via_authenticated_browser(tweet_id: str, timeout: float = 8.0):
         """Load the post in the logged-in browser session and watch its
         real network traffic for video CDN URLs. MUST be called from the
@@ -334,19 +390,7 @@ if _QT_OK:
         never loaded (offline, blocked, etc).
         """
         interceptor = _ensure_interceptor()
-        page = QWebEnginePage(shared_profile())
-        # A bare QWebEnginePage with no attached view has no real viewport -
-        # X (like most modern sites) only mounts the actual video player
-        # when its element is "visible" (IntersectionObserver), which never
-        # fires with no viewport at all. A real, sized QWebEngineView gives
-        # it one; moving the view far off-screen before showing it keeps it
-        # genuinely invisible to the user while still getting a real native
-        # window and a working compositor/viewport underneath.
-        view = QWebEngineView()
-        view.setPage(page)
-        view.resize(1000, 1400)
-        view.move(-32000, -32000)
-        view.show()
+        view, page = _ensure_resolve_view()
         url = f"https://x.com/i/status/{tweet_id}"
         interceptor.target_tweet_id = tweet_id
         interceptor.found = []
@@ -367,30 +411,55 @@ if _QT_OK:
         timer.start(int(timeout * 1000))
         loop.exec()
         timer.stop()
+        try:
+            page.loadFinished.disconnect(on_load)
+        except Exception:
+            pass  # the shared page is reused - never leave a stale
+            # per-call connection attached, or every future resolve's
+            # loadFinished would also re-fire every earlier call's closure
 
         if state["loaded"]:
-            # A sensitive/age-restricted post shows an interstitial ("this
-            # post might include sensitive content... View") that blocks the
-            # video element from ever mounting until it's clicked through -
-            # exactly the posts this whole fallback exists for. Click any
-            # such gate first, THEN nudge playback once it's had a moment to
-            # reveal the real post underneath - X often only requests the
-            # real video segments once playback starts, not just on load.
+            # Two separate things can block the real <video> from ever
+            # mounting, confirmed from real debug_authresolve.txt dumps:
+            # (1) a sensitive-content interstitial ("Content warning:
+            # Nudity... Show" - the button says "Show", not "View") that
+            # must be clicked before anything else renders; (2) even with
+            # no warning at all, the player itself is a click-to-mount
+            # thumbnail/poster - X doesn't create the <video> element until
+            # that's clicked, so just calling .play() on a <video> that
+            # doesn't exist yet is a no-op. Click both in sequence, with a
+            # pause between each so the next element has had a chance to
+            # actually appear, then nudge playback once a <video> exists.
             try:
                 page.runJavaScript(iife(
-                    "function clickGate(){"
-                    "  var nodes = document.querySelectorAll(\"div[role='button'],span\");"
+                    "function clickByText(re){"
+                    "  var nodes = document.querySelectorAll(\"div[role='button'],span,button\");"
                     "  for (var i = 0; i < nodes.length; i++) {"
-                    "    var t = (nodes[i].innerText || '').trim().toLowerCase();"
-                    "    if (t === 'view' || t === 'view profile photo') { nodes[i].click(); return true; }"
+                    "    var t = (nodes[i].innerText || '').trim();"
+                    "    if (re.test(t)) { nodes[i].click(); return true; }"
                     "  }"
                     "  return false;"
                     "}"
-                    "clickGate();"
-                    "setTimeout(function(){"
-                    "  clickGate();"
+                    "function clickVideoArea(){"
+                    "  var el = document.querySelector("
+                    "    \"[data-testid='videoComponent'],[data-testid='videoPlayer'],\"+"
+                    "    \"[data-testid='playButton'],[aria-label='Play'],[aria-label='Play Video']\");"
+                    "  if (el) { el.click(); return true; }"
+                    "  return false;"
+                    "}"
+                    "function nudgePlay(){"
                     "  var v = document.querySelector('video');"
                     "  if (v) { v.muted = true; v.play().catch(function(){}); }"
+                    "}"
+                    "clickByText(/^(show|view)$/i);"
+                    "setTimeout(function(){"
+                    "  clickByText(/^(show|view)$/i);"
+                    "  clickVideoArea();"
+                    "  nudgePlay();"
+                    "  setTimeout(function(){"
+                    "    clickVideoArea();"
+                    "    nudgePlay();"
+                    "  }, 600);"
                     "}, 700);"
                 ))
             except Exception:
@@ -399,17 +468,16 @@ if _QT_OK:
             settle_timer = QTimer()
             settle_timer.setSingleShot(True)
             settle_timer.timeout.connect(settle.quit)
-            settle_timer.start(2500)
+            settle_timer.start(3200)
             settle.exec()
 
-        interceptor.target_tweet_id = ""  # stop recording before teardown
+        interceptor.target_tweet_id = ""  # stop recording, keep the view/page
+        # for the next resolve - shutdown_resolve_view() tears it down for
+        # real, once, at app exit (see its docstring for why).
         urls = list(dict.fromkeys(interceptor.found))  # de-dup, keep order
         items = _video_items_from_urls(tweet_id, urls) if state["loaded"] else []
         if not items:
             _dump_resolve_debug(page, tweet_id, state["loaded"], urls)
-        view.hide()
-        view.deleteLater()
-        page.deleteLater()
         if not state["loaded"]:
             return None
         return items
@@ -719,3 +787,6 @@ else:  # no Qt / no QtWebEngine - keep the module importable anyway
 
     def resolve_via_authenticated_browser(*_args, **_kwargs):  # pragma: no cover
         return None
+
+    def shutdown_resolve_view(*_args, **_kwargs):  # pragma: no cover
+        pass

@@ -1060,6 +1060,12 @@ def main() -> None:
     app.setStyleSheet(QSS)
     win = MainWindow()
     win.show()
+    # QtWebEngine backs every page with its own child process; one left
+    # behind by Qt/Python's ordinary object teardown at process exit is
+    # exactly what keeps the app running in the background after the main
+    # window closes. Tear it down explicitly, every time, before the event
+    # loop actually stops.
+    app.aboutToQuit.connect(xweb.shutdown_resolve_view)
     sys.exit(app.exec())
 
 
