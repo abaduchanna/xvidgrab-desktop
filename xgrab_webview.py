@@ -324,7 +324,7 @@ if _QT_OK:
         except Exception:
             pass  # diagnostics must never break the actual resolve
 
-    def resolve_via_authenticated_browser(tweet_id: str, timeout: float = 12.0):
+    def resolve_via_authenticated_browser(tweet_id: str, timeout: float = 8.0):
         """Load the post in the logged-in browser session and watch its
         real network traffic for video CDN URLs. MUST be called from the
         GUI thread - QtWebEngine requires it; a background worker reaches
@@ -335,6 +335,18 @@ if _QT_OK:
         """
         interceptor = _ensure_interceptor()
         page = QWebEnginePage(shared_profile())
+        # A bare QWebEnginePage with no attached view has no real viewport -
+        # X (like most modern sites) only mounts the actual video player
+        # when its element is "visible" (IntersectionObserver), which never
+        # fires with no viewport at all. A real, sized QWebEngineView gives
+        # it one; moving the view far off-screen before showing it keeps it
+        # genuinely invisible to the user while still getting a real native
+        # window and a working compositor/viewport underneath.
+        view = QWebEngineView()
+        view.setPage(page)
+        view.resize(1000, 1400)
+        view.move(-32000, -32000)
+        view.show()
         url = f"https://x.com/i/status/{tweet_id}"
         interceptor.target_tweet_id = tweet_id
         interceptor.found = []
@@ -387,7 +399,7 @@ if _QT_OK:
             settle_timer = QTimer()
             settle_timer.setSingleShot(True)
             settle_timer.timeout.connect(settle.quit)
-            settle_timer.start(4000)
+            settle_timer.start(2500)
             settle.exec()
 
         interceptor.target_tweet_id = ""  # stop recording before teardown
@@ -395,6 +407,8 @@ if _QT_OK:
         items = _video_items_from_urls(tweet_id, urls) if state["loaded"] else []
         if not items:
             _dump_resolve_debug(page, tweet_id, state["loaded"], urls)
+        view.hide()
+        view.deleteLater()
         page.deleteLater()
         if not state["loaded"]:
             return None
