@@ -298,7 +298,11 @@ API.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       API.tabs.query({ active: true, lastFocusedWindow: true }).then((tabs) => {
         const tab = tabs && tabs[0];
         if (!tab || tab.id == null) { sendResponse({ ok: false, error: "No active tab." }); return; }
-        API.tabs.sendMessage(tab.id, { type: "xvg-fetchall", action: msg.action || "status" }).then(
+        API.tabs.sendMessage(tab.id, {
+          type: "xvg-fetchall",
+          action: msg.action || "status",
+          autoDownload: !!msg.autoDownload
+        }).then(
           (res) => sendResponse(res || { ok: false }),
           () => sendResponse({ ok: false, error: "Open x.com first." })
         );
