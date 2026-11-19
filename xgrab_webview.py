@@ -200,6 +200,13 @@ if _QT_OK:
         r"https://video\.twimg\.com/[^\s\"']+\.(?:mp4|m3u8)(?:\?[^\s\"']*)?"
     )
 
+    # How long the gate/thumbnail click-through polls for, and how often -
+    # X's React hydration time varies with network/render speed, so this
+    # keeps retrying across the whole window rather than guessing one delay.
+    RESOLVE_CLICK_INTERVAL_MS = 350
+    RESOLVE_CLICK_MAX_TRIES = 18          # 18 * 350ms = 6.3s of retrying
+    RESOLVE_SETTLE_MS = 6500              # Python-side wait >= the JS retry window
+
     class _VideoCaptureInterceptor(QWebEngineUrlRequestInterceptor):
         """Watches every request on the shared profile, but only records
         the ones whose originating page is the one resolve just navigated
@@ -427,9 +434,18 @@ if _QT_OK:
             # no warning at all, the player itself is a click-to-mount
             # thumbnail/poster - X doesn't create the <video> element until
             # that's clicked, so just calling .play() on a <video> that
-            # doesn't exist yet is a no-op. Click both in sequence, with a
-            # pause between each so the next element has had a chance to
-            # actually appear, then nudge playback once a <video> exists.
+            # doesn't exist yet is a no-op.
+            #
+            # A fixed-delay guess (click at 0ms, retry at 700ms) was STILL
+            # too early in real testing - X's React hydration of the tweet
+            # (and the gate/player inside it) can take longer than that,
+            # variably, depending on network/render speed. The debug dump
+            # taken at the END of the full settle window DID show the gate
+            # text correctly, proving the content eventually renders - the
+            # fixed delays just didn't wait long enough. Poll instead: keep
+            # retrying both clicks every 350ms for the whole settle window,
+            # so whenever hydration actually finishes, the very next tick
+            # catches it - no more guessing a single "right" delay.
             try:
                 page.runJavaScript(iife(
                     "function clickByText(re){"
@@ -449,18 +465,17 @@ if _QT_OK:
                     "}"
                     "function nudgePlay(){"
                     "  var v = document.querySelector('video');"
-                    "  if (v) { v.muted = true; v.play().catch(function(){}); }"
+                    "  if (v) { v.muted = true; v.play().catch(function(){}); return !!v; }"
+                    "  return false;"
                     "}"
-                    "clickByText(/^(show|view)$/i);"
-                    "setTimeout(function(){"
+                    f"var tries = 0, maxTries = {RESOLVE_CLICK_MAX_TRIES};"
+                    "var timer = setInterval(function(){"
+                    "  tries++;"
                     "  clickByText(/^(show|view)$/i);"
                     "  clickVideoArea();"
                     "  nudgePlay();"
-                    "  setTimeout(function(){"
-                    "    clickVideoArea();"
-                    "    nudgePlay();"
-                    "  }, 600);"
-                    "}, 700);"
+                    "  if (tries >= maxTries) clearInterval(timer);"
+                    f"}}, {RESOLVE_CLICK_INTERVAL_MS});"
                 ))
             except Exception:
                 pass
@@ -468,7 +483,7 @@ if _QT_OK:
             settle_timer = QTimer()
             settle_timer.setSingleShot(True)
             settle_timer.timeout.connect(settle.quit)
-            settle_timer.start(3200)
+            settle_timer.start(RESOLVE_SETTLE_MS)
             settle.exec()
 
         interceptor.target_tweet_id = ""  # stop recording, keep the view/page
