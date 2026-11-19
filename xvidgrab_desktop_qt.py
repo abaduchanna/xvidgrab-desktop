@@ -1045,11 +1045,20 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.cancel_event.set()
+        self.fetch_stop.set()
         try:
             self._save_cfg()
         except Exception:
             pass
         super().closeEvent(event)
+        # Hard guarantee the app actually exits here, rather than relying
+        # on Qt's implicit "quit when the last window closes" tracking -
+        # any other top-level widget still counted as open (even one the
+        # user never sees) silently defeats that and leaves the process
+        # running with no visible window, which is exactly what was
+        # reported. Closing the main window should always mean the app is
+        # gone, full stop.
+        QApplication.instance().quit()
 
 
 def main() -> None:

@@ -362,7 +362,12 @@ if _QT_OK:
             _resolve_view.setPage(_resolve_page)
             _resolve_view.resize(1000, 1400)
             _resolve_view.move(-32000, -32000)
-            _resolve_view.show()
+            # NOT shown here - see resolve_via_authenticated_browser(). A
+            # QWidget counts as an open top-level window for Qt's "quit
+            # when the last window closes" the moment .show() runs, even
+            # positioned off-screen - leaving it shown for the rest of the
+            # app's life is exactly what stopped the main window's close
+            # from ever actually quitting the app.
         return _resolve_view, _resolve_page
 
     def shutdown_resolve_view():
@@ -398,6 +403,10 @@ if _QT_OK:
         """
         interceptor = _ensure_interceptor()
         view, page = _ensure_resolve_view()
+        # Only open for the duration of this one resolve - see
+        # _ensure_resolve_view()'s note on why leaving it permanently shown
+        # blocks the app from ever quitting when the main window closes.
+        view.show()
         url = f"https://x.com/i/status/{tweet_id}"
         interceptor.target_tweet_id = tweet_id
         interceptor.found = []
@@ -493,6 +502,7 @@ if _QT_OK:
         items = _video_items_from_urls(tweet_id, urls) if state["loaded"] else []
         if not items:
             _dump_resolve_debug(page, tweet_id, state["loaded"], urls)
+        view.hide()  # closed between resolves - see the .show() note above
         if not state["loaded"]:
             return None
         return items
