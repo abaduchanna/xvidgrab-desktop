@@ -202,3 +202,18 @@ class TestResolveAll:
         items = c._resolve_all()
         assert seen["n"] <= 6            # stopped soon after the flag went up
         assert items == []
+
+
+class TestPageKind:
+    """page_kind / is_chat_url: every page URL gets the right collector."""
+
+    def test_chat_links_detected(self):
+        assert xsearch.is_chat_url("https://x.com/i/chat/704492940-704492940")
+        assert xsearch.is_chat_url("https://x.com/messages")
+        assert not xsearch.is_chat_url("https://x.com/Kazimirol2")
+
+    def test_kinds(self):
+        assert xsearch.page_kind("https://x.com/i/chat/1-2") == "chat"
+        assert xsearch.page_kind("https://x.com/search?q=a") == "search"
+        assert xsearch.page_kind("https://x.com/Kazimirol2") == "profile"
+        assert xsearch.page_kind("https://x.com/Kazimirol2/media") == "page"

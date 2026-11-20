@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -136,6 +138,94 @@ def _pil_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
     return buf.getvalue()
 
 
+class MultiPagesDialog(QDialog):
+    """'Multiple pages' - paste one or more links and add them all to the
+    running fetch list. Non-modal on purpose: the fetch keeps going (and
+    stays visible) while more links are pasted here."""
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{core.APP_NAME} - Multiple pages")
+        self.setMinimumSize(580, 430)
+        self.setModal(False)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        tip = QLabel(
+            "One link per line - ANY x.com link works:\n"
+            "post links, profiles (x.com/Kazimirol2), /media, search pages,\n"
+            "DM chat links (x.com/i/chat/...) or just @username.\n\n"
+            "Press 'Add to fetch list' and they join the already-running "
+            "fetch."
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
+        lay.addWidget(tip)
+
+        self.text = QPlainTextEdit()
+        self.text.setPlaceholderText(
+            "https://x.com/Kazimirol2\n"
+            "https://x.com/search?q=videos\n"
+            "https://x.com/user/status/123..."
+        )
+        lay.addWidget(self.text, 1)
+
+        btns = QHBoxLayout()
+        self.count_lbl = QLabel("")
+        self.count_lbl.setStyleSheet(f"color: {MUTED}; font-size: 8pt;")
+        self.count_lbl.setMinimumHeight(18)
+        btns.addWidget(self.count_lbl, 1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btns.addWidget(close_btn)
+        self.add_btn = QPushButton("Add to fetch list")
+        self.add_btn.setObjectName("primary")
+        self.add_btn.clicked.connect(self._submit)
+        btns.addWidget(self.add_btn)
+        lay.addLayout(btns)
+
+        self.text.textChanged.connect(self._update_count)
+        self._update_count()
+
+    def _update_count(self, *_args) -> None:
+        try:
+            s, p = core.classify_links(self.text.toPlainText())
+            n = len(s) + len(p)
+            self.count_lbl.setText(
+                f"{n} link{'s' if n != 1 else ''} detected"
+                if n else ""
+            )
+        except Exception:
+            pass
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Ctrl+Enter = submit from anywhere in the dialog
+        if (
+            event.modifiers() & Qt.ControlModifier
+            and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+        ):
+            self._submit()
+            return
+        super().keyPressEvent(event)
+
+    def _submit(self) -> None:
+        text = self.text.toPlainText().strip()
+        if not text:
+            return
+        win = self.parent()
+        added = 0
+        try:
+            added = win.add_links(text)
+        except Exception:
+            added = 0
+        if added:
+            self.text.clear()
+            self.count_lbl.setText(
+                f"{added} link{'s' if added != 1 else ''} added"
+            )
+
+
 class Controller(QObject):
     """Thread-safe bridge: worker threads emit, the main thread connects."""
 
@@ -148,6 +238,8 @@ class Controller(QObject):
     itemDone = Signal(tuple, str)                 # key, path
     itemFail = Signal(tuple, str)                 # key, error
     allDone = Signal()
+    pageDone = Signal(object)                     # Edge page-collection result
+    sessionCheck = Signal()                       # resolver idle -> GUI re-check
 
     # cross-thread bridge for the authenticated-browser resolve fallback -
     # QtWebEngine must run on the GUI thread, but batch-resolve runs on a
@@ -156,6 +248,11 @@ class Controller(QObject):
     # app for a worker thread calling back into the GUI thread.
     _browser_resolve_tweet_id = ""
     _browser_resolve_result = None
+
+    # same bridge for the browser-based thumbnail fallback (direct fetch
+    # blocked -> route the image through the embedded browser session)
+    _thumb_browser_url = ""
+    _thumb_browser_result = None
 
     @Slot()
     def _resolveViaBrowserSlot(self) -> None:
@@ -178,6 +275,28 @@ class Controller(QObject):
             self, "_resolveViaBrowserSlot", Qt.BlockingQueuedConnection
         )
         return self._browser_resolve_result
+
+    @Slot()
+    def _thumbViaBrowserSlot(self) -> None:
+        try:
+            self._thumb_browser_result = xweb.fetch_bytes_via_browser(
+                self._thumb_browser_url
+            )
+        except Exception:
+            self._thumb_browser_result = None
+
+    def fetch_thumb_via_browser_sync(self, url: str):
+        """Callable from any thread. Blocks the CALLING thread until the
+        embedded browser has tried to load the image at *url*. Returns
+        image bytes or None."""
+        if not xweb.webengine_available():
+            return None
+        self._thumb_browser_url = url
+        self._thumb_browser_result = None
+        QMetaObject.invokeMethod(
+            self, "_thumbViaBrowserSlot", Qt.BlockingQueuedConnection
+        )
+        return self._thumb_browser_result
 
 
 class MainWindow(QMainWindow):
@@ -205,10 +324,26 @@ class MainWindow(QMainWindow):
         self.ctl = Controller()
         self.cancel_event = threading.Event()
         self.fetch_stop = threading.Event()
-        self.search_running = False
         self.fetching = False
         self.downloading = False
         self._dl_done = self._dl_ok = self._dl_fail = self._dl_total = 0
+
+        # fetch-session engine state (page queue + unified resolver)
+        self._session_open = False
+        self._session_sources = 0        # page links not yet collected
+        self._session_total = 0          # all sources of this session
+        self._page_queue: list[str] = []  # pending page URLs
+        self._page_dialog = None          # active non-modal collection window
+        self._edge_page_running = False
+        self.id_queue = None              # tweet ids waiting to resolve
+        self._resolve_thread = None
+        self._resolve_thread_queue = None  # that worker's own queue
+        self._seen_ids: set[str] = set()
+        self._ids_ok = 0
+        self._ids_fail = 0
+        self._thumb_requested: set = set()
+        self._multi_dlg = None            # Multiple pages dialog (kept open)
+        self._thumb_browser_failures = 0
 
         self._build()
         self._connect()
@@ -241,7 +376,7 @@ class MainWindow(QMainWindow):
         f.setPointSize(13)
         f.setBold(True)
         name.setFont(f)
-        sub = QLabel("Paste an X post link - or a search link (x.com/search?q=...) - search pages open inside the app, browser-free")
+        sub = QLabel("Paste ANY x.com link - post, profile, /media, search or DM chat - pages open inside the app, browser-free")
         sub.setStyleSheet(f"color: {MUTED}; font-size: 9pt;")
         hleft.addWidget(name)
         hleft.addWidget(sub)
@@ -256,11 +391,14 @@ class MainWindow(QMainWindow):
         urlrow = QHBoxLayout()
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText(
-            "https://x.com/user/status/123... or https://x.com/search?q=..."
-            "   (several post links in one paste are fine)"
+            "https://x.com/user/status/123... - or a profile, /media, search or chat link "
+            "   (several links in one paste are fine)"
         )
         self.url_edit.returnPressed.connect(self.start_fetch)
         urlrow.addWidget(self.url_edit, 1)
+        self.multi_btn = QPushButton("Multiple pages")
+        self.multi_btn.clicked.connect(self.open_multi_dialog)
+        urlrow.addWidget(self.multi_btn)
         self.fetch_btn = QPushButton("Fetch videos")
         self.fetch_btn.setObjectName("primary")
         self.fetch_btn.clicked.connect(self.start_fetch)
@@ -307,9 +445,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self.scroll, 1)
 
         self.empty_lbl = QLabel(
-            "Paste an X post link above and press Fetch videos\n\n"
-            "Every video on that page shows up here with a thumbnail\n\n"
-            "Multiple links in one paste are fine too"
+            "Paste any x.com link above and press Fetch videos\n\n"
+            "A single post, a whole profile, /media, a search page or a chat -\n"
+            "every video on that page shows up here with a thumbnail\n\n"
+            "Use 'Multiple pages' to add many links at once"
         )
         self.empty_lbl.setAlignment(Qt.AlignCenter)
         self.empty_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11pt;")
@@ -365,145 +504,155 @@ class MainWindow(QMainWindow):
         self.ctl.itemDone.connect(self._on_item_done)
         self.ctl.itemFail.connect(self._on_item_fail)
         self.ctl.allDone.connect(self._on_all_done)
+        self.ctl.pageDone.connect(self._on_page_done)
+        self.ctl.sessionCheck.connect(self._on_session_check)
 
     # -------------------------------------------------------------- fetch
+    def _expand_input(self, text: str) -> str:
+        """Expand t.co short links so every wrapped link is classifiable."""
+        if core._TCO_RE.search(text):
+            try:
+                return core.expand_tco_links(text)
+            except Exception:
+                return text
+        return text
+
     def start_fetch(self) -> None:
-        # clicking while a fetch/search is running stops it (keeps results
+        # clicking while a fetch session is running stops it (keeps results
         # already found) - a large batch's cooldown-and-retry passes can
         # take a while, so there has to be a way out.
-        if self.search_running or self.fetching:
+        if self._session_open or self.fetching:
             self.fetch_stop.set()
             self.set_status("Stopping - please wait...", AMBER)
             return
         if self.downloading:
             return
         text = self.url_edit.text().strip()
-
-        search_url = xsearch.is_search_url(text)
-        if not search_url and core._TCO_RE.search(text):
-            try:
-                search_url = xsearch.is_search_url(core.expand_tco_links(text))
-            except Exception:
-                search_url = None
-
-        def do_fetch():
-            urls = core.parse_status_urls(text)
-            if not urls and core._TCO_RE.search(text):
-                try:
-                    urls = core.parse_status_urls(core.expand_tco_links(text))
-                except Exception:
-                    urls = []
-            if not urls:
-                self.ctl.fetchError.emit(
-                    "No X post link or search link found in the input.\n"
-                    "Paste a link like x.com/user/status/123...\n"
-                    "or a search page like x.com/search?q=videos"
-                )
-                return
-            self.ctl.fetchStarted.emit(
-                f"Fetching {len(urls)} link{'s' if len(urls) > 1 else ''}..."
+        status_urls, page_urls = core.classify_links(self._expand_input(text))
+        if not status_urls and not page_urls:
+            QMessageBox.warning(
+                self,
+                core.APP_NAME,
+                "No x.com link found in the input.\n\n"
+                "Paste ANY x.com link - a post (x.com/user/status/123), a\n"
+                "profile (x.com/Kazimirol2), /media, a search page or a DM\n"
+                "chat link - and every video on that page is fetched.\n\n"
+                "Use 'Multiple pages' to add several links at once.",
             )
-            def on_error(u, msg):
-                if not u:
-                    # batch-level progress note (e.g. a cooldown
-                    # announcement), not a real per-link failure - route
-                    # through fetchStarted so it never pops a warning dialog
-                    self.ctl.fetchStarted.emit(msg)
-                else:
-                    self.ctl.fetchError.emit(f"{u}: {msg}")
-
-            self.fetch_stop.clear()
-            ok_count, fail_count = core.fetch_videos_batch(
-                urls,
-                on_item=lambda items: self.ctl.metaReady.emit(items),
-                on_error=on_error,
-                stop_event=self.fetch_stop,
-                resolve_fallback=self.ctl.resolve_via_browser_sync,
-            )
-            self._last_fetch_ok = ok_count
-            self._last_fetch_fail = fail_count
-            self._last_fetch_total = len(urls)
-            self.ctl.fetchDone.emit()
-
+            return
         self.fetching = True
-        # reset previous results
+        self._reset_results()
+        self._start_session(status_urls, page_urls)
+
+    def add_links(self, text: str, reset: bool = False) -> int:
+        """Classify *text* and add its links to the fetch session.
+
+        Called by the Multiple pages dialog (and available for future
+        callers). When a session is already running the new links simply
+        join it - page links queue up behind the current one, post links
+        resolve straight away alongside whatever is already running.
+        Returns the number of links accepted.
+        """
+        status_urls, page_urls = core.classify_links(self._expand_input(text))
+        count = len(status_urls) + len(page_urls)
+        if not count:
+            self.set_status(
+                "No x.com links found in the pasted text.", AMBER
+            )
+            return 0
+        if reset or not self._session_open:
+            if reset and not self.downloading:
+                self.fetching = True
+                self._reset_results()
+            elif not self._session_open:
+                self.fetching = True
+            self._start_session(status_urls, page_urls)
+        else:
+            # join the already-running fetch list
+            self._session_sources += len(page_urls)
+            self._session_total += count
+            for u in status_urls:
+                m = core._STATUS_RE.search(u)
+                if m and self.id_queue is not None:
+                    self.id_queue.put(m.group(2))
+            self._page_queue.extend(page_urls)
+            self.set_status(
+                f"{count} link{'s' if count != 1 else ''} added to the "
+                "running fetch list", ACCENT,
+            )
+            QTimer.singleShot(0, self._pump_pages)
+        return count
+
+    def _reset_results(self) -> None:
+        """Reset previous results (a fresh fetch from the main input)."""
         self.items = []
         self.item_map = {}
         self.cards = {}
         self.pixmaps = {}
         self._thumb_requested = set()
         self.status_state = {}
-        self._last_fetch_ok = 0
-        self._last_fetch_fail = 0
-        self._last_fetch_total = 0
         self._clear_results()
         self._update_counter()
-        if search_url:
-            self._begin_search(search_url)
-            return
-        self.fetch_stop.clear()
-        self.fetch_btn.setEnabled(True)
-        self.fetch_btn.setText("Stop")
-        self.set_status("Fetching...", MUTED)
-        threading.Thread(target=do_fetch, daemon=True).start()
 
-    # ------------------------------------------------------ search (in-app)
-    def _begin_search(self, search_url: str) -> None:
-        """Search links: collect inside the in-app browser window.
+    # ------------------------------------------------------ fetch session
+    def _start_session(self, status_urls: list, page_urls: list) -> None:
+        """Open a fetch session: one resolver worker + a page queue.
 
-        The embedded window (QtWebEngine) loads the page, hosts the X login
-        when needed and auto-scrolls to the end - nothing ever opens outside
-        the app.  Only when the embedded browser is unavailable does the
-        legacy Edge automation run as a fallback.
+        Post links are turned into tweet ids and resolved through the
+        public syndication endpoint. Every page link (profiles, /media,
+        searches, chats) opens the in-app browser window one after another
+        - each new link added mid-run joins the same queues, which is what
+        'Multiple pages' builds on.
         """
-        self.search_running = True
         self.fetch_stop.clear()
-        # keep the button alive as a Stop control during collection
+        self._session_open = True
+        self._session_sources = len(page_urls)
+        self._session_total = len(status_urls) + len(page_urls)
+        self._ids_ok = 0
+        self._ids_fail = 0
+        self._seen_ids = set()
+        self.id_queue = queue.Queue()
+        self._page_queue = list(page_urls)
+        # if a previous session's resolver thread is still unwinding, tell
+        # it to stop now (its sentinel) so it never lingers spinning
+        if (
+            self._resolve_thread is not None
+            and self._resolve_thread.is_alive()
+            and isinstance(self._resolve_thread_queue, queue.Queue)
+        ):
+            try:
+                self._resolve_thread_queue.put(None)
+            except Exception:
+                pass
+        self._resolve_thread_queue = self.id_queue
+
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Stop")
-        if not xweb.webengine_available():
+
+        if status_urls:
             self.set_status(
-                "Built-in browser unavailable - using Edge instead...", AMBER
+                f"Fetching {self._session_total} "
+                f"link{'s' if self._session_total != 1 else ''}...", MUTED
             )
-            threading.Thread(
-                target=lambda: self._do_search_fetch(search_url), daemon=True
-            ).start()
-            return
-        self.set_status("Opening the search page inside the app...", MUTED)
-        # resolve videos WHILE still scrolling instead of after: a worker
-        # thread drains tweet ids off this queue as the dialog finds them,
-        # so fetching and resolving overlap instead of running back-to-back.
-        id_queue: queue.Queue = queue.Queue()
-        self._search_resolved_ids: set[str] = set()
-        worker = threading.Thread(
-            target=self._search_resolve_worker, args=(id_queue,), daemon=True
+            for u in status_urls:
+                m = core._STATUS_RE.search(u)
+                if m:
+                    self.id_queue.put(m.group(2))
+        self._resolve_thread = threading.Thread(
+            target=self._resolve_worker_loop, args=(self.id_queue,),
+            daemon=True,
         )
-        worker.start()
+        self._resolve_thread.start()
+        self._pump_pages()
 
-        def on_new_ids(ids: list) -> None:
-            for tid in ids:
-                id_queue.put(tid)
-
-        try:
-            result = xweb.run_search_dialog(
-                self,
-                search_url,
-                progress=lambda msg: self.set_status(msg, MUTED),
-                stop_event=self.fetch_stop,
-                on_new_ids=on_new_ids,
-            )
-        except Exception as exc:  # defensive - the dialog must never kill the app
-            self.ctl.fetchError.emit(f"The in-app search window failed: {exc}")
-            id_queue.put(None)  # worker drains remaining ids then emits fetchDone
-            return
-        self._after_search_dialog(result, id_queue)
-
-    def _search_resolve_worker(self, id_queue: "queue.Queue") -> None:
+    def _resolve_worker_loop(self, id_queue: "queue.Queue") -> None:
         """Drain tweet ids off *id_queue* and resolve them as they arrive.
 
-        Runs for the whole life of a search: starts as soon as scrolling
-        begins and keeps going until a ``None`` sentinel (pushed once the
-        collection dialog is done) and the queue is empty.
+        Runs for the whole life of a session: post links and every video
+        post harvested from a page all flow through this one worker, so
+        syndication requests stay paced and results land live. Exits when
+        a ``None`` sentinel arrives (pushed by _maybe_finish_session once
+        every source is done) and the queue is drained.
         """
         done = False
         while True:
@@ -527,11 +676,9 @@ class MainWindow(QMainWindow):
                     done = True
                 else:
                     batch.append(nxt)
-            batch = [
-                tid for tid in batch if tid not in self._search_resolved_ids
-            ]
+            batch = [tid for tid in batch if tid not in self._seen_ids]
             if batch:
-                self._search_resolved_ids.update(batch)
+                self._seen_ids.update(batch)
                 try:
                     xsearch.resolve_ids(
                         batch,
@@ -539,56 +686,163 @@ class MainWindow(QMainWindow):
                         on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
                         stop_event=self.fetch_stop,
                         resolve_fallback=self.ctl.resolve_via_browser_sync,
+                        on_counts=self._on_resolve_counts,
                     )
                 except Exception as exc:  # defensive
                     self.ctl.fetchError.emit(f"Unexpected error: {exc}")
             if done and id_queue.empty():
                 break
-        self.search_running = False
-        self.ctl.fetchDone.emit()
+            if not done and id_queue.empty():
+                # queue fully drained but sources may still be closing -
+                # nudge the GUI thread to re-check session completion
+                self.ctl.sessionCheck.emit()
+        # only the CURRENT session's worker may close it down (a stopped
+        # session can be followed by a new one while this thread unwinds)
+        if self.id_queue is id_queue:
+            self._session_open = False
+            self.fetching = False
+            self.ctl.fetchDone.emit()
 
-    def _after_search_dialog(self, result: dict, id_queue: "queue.Queue") -> None:
-        """Dialog closed: hand any remaining ids to the resolve worker."""
-        found = result.get("found") or {}
-        err = result.get("error")
-        if err:
-            id_queue.put(None)
-            self.ctl.fetchError.emit(err)
+    def _on_resolve_counts(self, ok: int, failed: int) -> None:
+        self._ids_ok += ok
+        self._ids_fail += failed
+
+    def _on_session_check(self) -> None:
+        self._maybe_finish_session()
+
+    def _maybe_finish_session(self) -> None:
+        """End the session once every source is closed and drained."""
+        if not self._session_open:
             return
-        if not found:
-            id_queue.put(None)
-            if result.get("stopped"):
-                self.set_status("Collection stopped.", AMBER)
-            else:
-                self.ctl.fetchError.emit(
-                    "Scrolled the whole page but found no video posts.\n"
-                    "The search results may contain no videos."
+        if (
+            self._session_sources == 0
+            and not self._page_queue
+            and self._page_dialog is None
+            and not self._edge_page_running
+            and self.id_queue is not None
+            and self.id_queue.empty()
+        ):
+            self.id_queue.put(None)  # resolver sentinel
+
+    # ----------------------------------------------------------- pages
+    def _pump_pages(self) -> None:
+        """Start collecting the next page link (one in-app window at a time).
+
+        Called whenever a link is added or a page finishes; page links added
+        mid-run simply wait here behind the one currently being collected.
+        """
+        if not self._session_open:
+            return
+        if self.fetch_stop.is_set():
+            # Stop pressed - drop everything still queued and end the session
+            self._page_queue.clear()
+            self._session_sources = 0
+            self._maybe_finish_session()
+            return
+        if self._page_dialog is not None or self._edge_page_running:
+            return
+        if not self._page_queue:
+            return
+        url = self._page_queue.pop(0)
+        kind = xsearch.page_kind(url)
+
+        if xsearch.is_chat_url(url) and not xweb.webengine_available():
+            self.ctl.fetchError.emit(
+                f"{url}: DM chats need the built-in browser, which is not "
+                "available in this build."
+            )
+            self._source_closed()
+            QTimer.singleShot(0, self._pump_pages)
+            return
+
+        if xweb.webengine_available():
+            self.set_status(f"Opening the {kind} page inside the app...", MUTED)
+            try:
+                self._page_dialog = xweb.run_page_dialog_async(
+                    self,
+                    url,
+                    progress=lambda msg: self.set_status(msg, MUTED),
+                    stop_event=self.fetch_stop,
+                    on_new_ids=self._queue_new_ids,
+                    on_done=self._on_page_done,
                 )
-            return
-        # on_new_ids already queued everything the dialog ever found, but
-        # push the full set again (a no-op for ones the worker already
-        # resolved) as a safety net in case a late batch was missed.
-        for tid in found:
-            id_queue.put(tid)
-        id_queue.put(None)
+            except Exception as exc:  # defensive - never kill the app
+                self._page_dialog = None
+                self.ctl.fetchError.emit(
+                    f"The in-app browser window failed: {exc}"
+                )
+                self._source_closed()
+                QTimer.singleShot(0, self._pump_pages)
+        else:
+            self._edge_page_running = True
+            self.set_status(
+                "Built-in browser unavailable - using Edge instead...", AMBER
+            )
+            threading.Thread(
+                target=self._edge_page_worker, args=(url,), daemon=True
+            ).start()
 
-    def _do_search_fetch(self, search_url: str) -> None:
-        """Worker (fallback only): scroll the page in Edge and resolve."""
+    def _edge_page_worker(self, url: str) -> None:
+        """Fallback page collector (Edge) for when QtWebEngine is absent."""
+        result: dict = {
+            "found": {}, "stopped": False, "error": None,
+            "dm_urls": [], "dm_posters": [], "kind": xsearch.page_kind(url),
+        }
         try:
             collector = xsearch.SearchCollector(
-                search_url,
+                url,
                 progress=lambda msg: self.ctl.fetchStarted.emit(msg),
                 on_items=lambda chunk: self.ctl.metaReady.emit(chunk),
                 stop_event=self.fetch_stop,
             )
             collector.collect()
         except core.XGrabError as exc:
-            self.ctl.fetchError.emit(str(exc))
+            result["error"] = str(exc)
         except Exception as exc:  # defensive
-            self.ctl.fetchError.emit(f"Unexpected error: {exc}")
-        finally:
-            self.search_running = False
-            self.ctl.fetchDone.emit()
+            result["error"] = f"Unexpected error: {exc}"
+        self.ctl.pageDone.emit(result)
+
+    def _on_page_done(self, result: dict) -> None:
+        self._page_dialog = None
+        self._edge_page_running = False
+        self._handle_page_result(result)
+        self._source_closed()
+        QTimer.singleShot(0, self._pump_pages)
+
+    def _handle_page_result(self, result: dict) -> None:
+        err = result.get("error")
+        if err:
+            self.ctl.fetchError.emit(err)
+        dm_urls = result.get("dm_urls") or []
+        if dm_urls:
+            items = xweb.build_dm_items(dm_urls, result.get("dm_posters"))
+            if items:
+                self.ctl.metaReady.emit(items)
+            elif not err:
+                self.ctl.fetchError.emit(
+                    "The chat was walked but no downloadable video stream "
+                    "was captured."
+                )
+            return
+        found = result.get("found") or {}
+        # on_new_ids already queued everything found during scrolling; push
+        # the full set again (a no-op for resolved ones) as a safety net.
+        for tid in found:
+            self._queue_new_ids([tid])
+        if not found and not err and not result.get("stopped"):
+            self.ctl.fetchError.emit(
+                "Scrolled the whole page but found no video posts - the "
+                "page may contain no videos."
+            )
+
+    def _queue_new_ids(self, ids: list) -> None:
+        if self.id_queue is not None:
+            for tid in ids:
+                self.id_queue.put(tid)
+
+    def _source_closed(self) -> None:
+        self._session_sources = max(0, self._session_sources - 1)
+        self._maybe_finish_session()
 
     def _on_fetch_started(self, text: str) -> None:
         self.set_status(text, MUTED)
@@ -611,7 +865,10 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_error(self, err: str) -> None:
         self.set_status(err, RED)
-        if not self.items:
+        # A modal warning only when a fetch is NOT running at all and
+        # nothing was found - per-page failures during a multi-link run
+        # stay in the status line so a bad link never interrupts the rest.
+        if not self.items and not self._session_open:
             QMessageBox.warning(self, core.APP_NAME, err)
 
     def _refresh_results_ui(self) -> None:
@@ -628,26 +885,28 @@ class MainWindow(QMainWindow):
 
     def _on_fetch_done(self) -> None:
         self.fetching = False
-        self.search_running = False
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText("Fetch videos")
         if self.items:
             self._refresh_results_ui()
-            total_links = getattr(self, "_last_fetch_total", 0)
-            fail_links = getattr(self, "_last_fetch_fail", 0)
-            ok_links = getattr(self, "_last_fetch_ok", 0)
+            fail_links = self._ids_fail
             summary = (
                 f"{len(self.items)} video{'s' if len(self.items) != 1 else ''} found"
             )
-            if total_links:
+            if self._session_total:
                 summary += (
-                    f" from {ok_links}/{total_links} "
-                    f"link{'s' if total_links != 1 else ''}"
+                    f" from {self._session_total} "
+                    f"link{'s' if self._session_total != 1 else ''}"
                 )
-                if fail_links:
-                    summary += f" ({fail_links} link{'s' if fail_links != 1 else ''} failed - see above)"
+            if fail_links:
+                summary += (
+                    f" ({fail_links} link{'s' if fail_links != 1 else ''} "
+                    "failed - see above)"
+                )
             summary += " - pick and press Download selected"
             self.set_status(summary, GREEN if not fail_links else AMBER)
+        elif not self._session_open:
+            self.set_status("No videos found in the fetched links.", AMBER)
 
     # ------------------------------------------------------------ results
     def _clear_results(self):
@@ -809,13 +1068,32 @@ class MainWindow(QMainWindow):
         # yet, or a 256-link batch would resubmit the same early items'
         # thumbnail jobs hundreds of times.
         def job(item: core.VideoItem):
+            data = None
             try:
                 data = core.fetch_thumbnail_bytes(item, "small")
-                self.ctl.thumbReady.emit(item.key, data)
             except Exception:
-                pass  # placeholder stays
+                data = None
+            if not data and item.thumbnail_url:
+                # Direct fetch failed (some VPNs, proxies and ISP-level
+                # blocks stop plain urllib reaching pbs.twimg.com while the
+                # in-app browser still works). Route the image through the
+                # embedded browser session - capped so a fully offline
+                # machine does not trigger hundreds of page loads.
+                if self._thumb_browser_failures < 6:
+                    data = self.ctl.fetch_thumb_via_browser_sync(
+                        item.thumbnail_url
+                    )
+                    if not data:
+                        self._thumb_browser_failures += 1
+                else:
+                    return  # placeholder stays
+            if data:
+                self.ctl.thumbReady.emit(item.key, data)
 
-        pending = [it for it in self.items if it.key not in self._thumb_requested]
+        pending = [
+            it for it in self.items
+            if it.key not in self._thumb_requested and it.thumbnail_url
+        ]
         if not pending:
             return
         pool = ThreadPoolExecutor(max_workers=THUMB_POOL)
@@ -867,6 +1145,14 @@ class MainWindow(QMainWindow):
             self.output_dir = d
             self.folder_lbl.setText(self._short_dir())
             self._save_cfg()
+
+    def open_multi_dialog(self) -> None:
+        """Open (or raise) the 'Multiple pages' paste window."""
+        if self._multi_dlg is None:
+            self._multi_dlg = MultiPagesDialog(self)
+        self._multi_dlg.show()
+        self._multi_dlg.raise_()
+        self._multi_dlg.activateWindow()
 
     def quality_cap(self):
         val = self.quality_box.currentText()
@@ -1046,6 +1332,16 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.cancel_event.set()
         self.fetch_stop.set()
+        if self._page_dialog is not None:
+            try:
+                self._page_dialog.close()
+            except Exception:
+                pass
+        if self._multi_dlg is not None:
+            try:
+                self._multi_dlg.close()
+            except Exception:
+                pass
         try:
             self._save_cfg()
         except Exception:

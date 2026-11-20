@@ -30,7 +30,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 APP_NAME = "XVidGrab Desktop"
 
 USER_AGENT = (
@@ -73,6 +73,89 @@ _STATUS_RE = re.compile(
 )
 _TCO_RE = re.compile(r"(?:https?://)?t\.co/([A-Za-z0-9]+)", re.IGNORECASE)
 _DIMS_RE = re.compile(r"/(\d{2,5})x(\d{2,5})(?:/|$|\?)")
+
+# ANY x.com / twitter.com link with a path (profile, /media, /i/chat/...,
+# /messages, /search, /hashtag, /explore, /home, /bookmarks ...). Used by
+# classify_links() so every X link a user can paste is fetchable, not just
+# post links and search pages.
+_ANY_X_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.|mobile\.)?(?:twitter|x)\.com"
+    r"(/[A-Za-z0-9_@\-.~/?=&;+%]*)",
+    re.IGNORECASE,
+)
+_BARE_HANDLE_RE = re.compile(r"^@([A-Za-z0-9_]{1,15})$")
+_BARE_WORD_RE = re.compile(r"^([A-Za-z0-9_]{1,15})$")
+
+
+def _normalize_x_url(raw: str) -> str:
+    """Normalise any x.com/twitter.com link to https://x.com<path>?<query>."""
+    u = raw.strip().rstrip(".,;:!?)\u201d\u2019")
+    if not u.lower().startswith("http"):
+        u = "https://" + u
+    parsed = urllib.parse.urlsplit(u)
+    path = parsed.path or ""
+    return urllib.parse.urlunsplit(("https", "x.com", path, parsed.query, ""))
+
+
+def classify_links(text: str) -> tuple[list[str], list[str]]:
+    """Split mixed pasted input into (post_links, page_links).
+
+    Post links (x.com/<user>/status/<id>) are resolved fast through the
+    public syndication endpoint. EVERY other x.com link - profile pages
+    (x.com/Kazimirol2), /media, /with_replies, DM chat links
+    (x.com/i/chat/...), /messages, bookmarks, hashtag/explore pages and of
+    course search links - is returned as a page link; the GUI opens those
+    in the in-app browser, scrolls them and harvests the videos.
+
+    Bare handles pasted without a link (@Kazimirol2, or a lone handle when
+    the input contains no link at all) become profile page links, and a
+    bare numeric token is treated as a tweet id. De-duplicated, order kept.
+    """
+    if not text:
+        return [], []
+    out_status: list[str] = []
+    out_pages: list[str] = []
+    seen: set[str] = set()
+
+    def push(url: str, is_status: bool) -> None:
+        low = url.lower()
+        if low in seen:
+            return
+        seen.add(low)
+        (out_status if is_status else out_pages).append(url)
+
+    for match in _ANY_X_URL_RE.finditer(text):
+        url = _normalize_x_url(match.group(0))
+        path = urllib.parse.urlsplit(url).path
+        if not path or path == "/":
+            continue  # bare domain - nothing to fetch
+        if _STATUS_RE.search(url):
+            m = _STATUS_RE.search(url)
+            push(f"https://x.com/{m.group(1)}/status/{m.group(2)}", True)
+        else:
+            push(url, False)
+
+    # Bare handles / ids: @name always, and name-only tokens only when the
+    # input holds no link at all (so plain prose never turns into fetches).
+    has_links = bool(_ANY_X_URL_RE.search(text)) or bool(_TCO_RE.search(text))
+    if not has_links or "@" in text:
+        for line in text.splitlines():
+            token = line.strip().rstrip(".,;:!")
+            if not token or "/" in token or "." in token:
+                continue
+            m = _BARE_HANDLE_RE.match(token)
+            if m:
+                push(f"https://x.com/{m.group(1)}", False)
+                continue
+            if not has_links:
+                m = _BARE_WORD_RE.match(token)
+                if not m:
+                    continue
+                if m.group(1).isdigit():
+                    push(f"https://x.com/i/status/{m.group(1)}", True)
+                else:
+                    push(f"https://x.com/{m.group(1)}", False)
+    return out_status, out_pages
 
 
 class XGrabError(Exception):
@@ -497,7 +580,12 @@ def fetch_videos_batch(
                     f"{len(pending)} link(s) still rate-limited - "
                     f"cooling down {int(cooldown)}s before retrying...",
                 )
-            time.sleep(cooldown)
+            # stop-aware sleep: a Stop press must end the wait within a
+            # second instead of sleeping the full cooldown first
+            for _ in range(int(cooldown * 4)):
+                if stop_event is not None and stop_event.is_set():
+                    return ok_count, hard_fail_count + len(pending)
+                time.sleep(0.25)
             cooldown = min(cooldown * BATCH_COOLDOWN_GROWTH, BATCH_COOLDOWN_MAX)
 
     hard_fail_count += len(pending)  # exhausted all passes, still limited
@@ -520,16 +608,35 @@ def thumbnail_url_for(item: VideoItem, size: str = "small") -> str:
 
 
 def fetch_thumbnail_bytes(item: VideoItem, size: str = "small") -> bytes:
-    """Download thumbnail bytes; falls back to the bare URL on failure."""
+    """Download thumbnail bytes with layered fallbacks.
+
+    1. the bandwidth-friendly name= URL
+    2. the bare (original) thumbnail URL
+    3. a browser-style request with a Referer header - some proxies and
+       CDN edges reject the plain request but serve it with referer
+    """
     url = thumbnail_url_for(item, size)
     if not url:
         raise XGrabError("No thumbnail for this video.")
     try:
         return _http_get(url)
     except Exception:
-        if url != item.thumbnail_url and item.thumbnail_url:
+        pass
+    if url != item.thumbnail_url and item.thumbnail_url:
+        try:
             return _http_get(item.thumbnail_url)
-        raise
+        except Exception:
+            pass
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": "https://x.com/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        return resp.read()
 
 
 # --------------------------------------------------------------------------

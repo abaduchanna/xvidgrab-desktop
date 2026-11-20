@@ -271,9 +271,10 @@ class TestGuiWiring:
         src = self._qt_source()
         assert "import xgrab_webview as xweb" in src
         assert "xweb.webengine_available()" in src
-        assert "xweb.run_search_dialog(" in src
+        # non-modal in-app page window (fetch queue: links join the run)
+        assert "xweb.run_page_dialog_async(" in src
         # legacy Edge path only as fallback
-        assert "_do_search_fetch(search_url)" in src
+        assert "xsearch.SearchCollector(" in src
 
     def test_spec_bundles_qtwebengine(self):
         spec = (ROOT / "xvidgrab_desktop_qt.spec").read_text(encoding="utf-8")
@@ -290,3 +291,44 @@ class TestGuiWiring:
         assert hasattr(xsearch, "resolve_ids")
         src = self._qt_source()
         assert "xsearch.resolve_ids(" in src
+
+
+class TestBuildDmItems:
+    """build_dm_items: captured chat CDN URLs become download-list items."""
+
+    def test_groups_variants_of_one_video(self):
+        urls = [
+            "https://video.twimg.com/dm/1/vid/avc1/1280x720/a.mp4",
+            "https://video.twimg.com/dm/1/vid/avc1/480x270/b.mp4",
+        ]
+        items = xweb.build_dm_items(urls)
+        assert len(items) == 1
+        assert len(items[0].formats) == 2
+        assert items[0].formats[0].height >= items[0].formats[-1].height
+
+    def test_separate_prefixes_are_separate_videos(self):
+        urls = [
+            "https://video.twimg.com/dm/1/vid/avc1/1280x720/a.mp4",
+            "https://video.twimg.com/dm/2/vid/avc1/1280x720/b.mp4",
+        ]
+        items = xweb.build_dm_items(urls)
+        assert len(items) == 2
+
+    def test_posters_attach_in_order(self):
+        urls = [
+            "https://video.twimg.com/dm/1/vid/avc1/720x720/a.mp4",
+            "https://video.twimg.com/dm/2/vid/avc1/720x720/b.mp4",
+        ]
+        posters = [
+            "https://pbs.twimg.com/ext_tw_video_thumb/1/pu/img/x.jpg",
+            "https://pbs.twimg.com/ext_tw_video_thumb/2/pu/img/y.jpg",
+        ]
+        items = xweb.build_dm_items(urls, posters)
+        assert items[0].thumbnail_url == posters[0]
+        assert items[1].thumbnail_url == posters[1]
+
+    def test_m3u8_ignored(self):
+        items = xweb.build_dm_items(
+            ["https://video.twimg.com/dm/1/avc1/720x720/a.m3u8"]
+        )
+        assert items == []

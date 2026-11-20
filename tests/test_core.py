@@ -326,3 +326,87 @@ class TestHelpers:
         assert core.unique_path(p) == p
         open(p, "w").close()
         assert core.unique_path(p) == str(tmp_path / "a (1).mp4")
+
+
+class TestClassifyLinks:
+    """classify_links: any x.com link is fetchable, not just posts/searches."""
+
+    def test_profile_link_is_a_page(self):
+        status, pages = core.classify_links("https://x.com/Kazimirol2")
+        assert status == []
+        assert pages == ["https://x.com/Kazimirol2"]
+
+    def test_chat_link_is_a_page(self):
+        status, pages = core.classify_links(
+            "https://x.com/i/chat/704492940-704492940"
+        )
+        assert status == []
+        assert pages == ["https://x.com/i/chat/704492940-704492940"]
+
+    def test_status_link_is_a_post(self):
+        status, pages = core.classify_links("https://x.com/user/status/12345")
+        assert status == ["https://x.com/user/status/12345"]
+        assert pages == []
+
+    def test_status_variants_are_posts(self):
+        for link in (
+            "https://twitter.com/NASA/status/999",
+            "x.com/user/status/123/photo/1",
+            "https://x.com/user/status/456/video/1",
+        ):
+            status, pages = core.classify_links(link)
+            assert len(status) == 1, link
+            assert pages == []
+
+    def test_search_and_media_are_pages(self):
+        status, pages = core.classify_links(
+            "https://x.com/search?q=videos https://x.com/user/media"
+        )
+        assert status == []
+        assert len(pages) == 2
+
+    def test_mixed_paste_splits_by_kind(self):
+        status, pages = core.classify_links(
+            "https://x.com/a\nhttps://x.com/b/status/42\nhttps://x.com/c/media"
+        )
+        assert status == ["https://x.com/b/status/42"]
+        assert pages == ["https://x.com/a", "https://x.com/c/media"]
+
+    def test_bare_handle_becomes_profile(self):
+        status, pages = core.classify_links("@Kazimirol2")
+        assert pages == ["https://x.com/Kazimirol2"]
+
+    def test_bare_handle_alone_becomes_profile(self):
+        status, pages = core.classify_links("Kazimirol2")
+        assert pages == ["https://x.com/Kazimirol2"]
+
+    def test_bare_number_becomes_status_id(self):
+        status, pages = core.classify_links("1234567890")
+        assert status == ["https://x.com/i/status/1234567890"]
+
+    def test_prose_never_becomes_links(self):
+        status, pages = core.classify_links("just some prose text here")
+        assert status == []
+        assert pages == []
+
+    def test_bare_domain_ignored(self):
+        status, pages = core.classify_links("https://x.com")
+        assert status == []
+        assert pages == []
+
+    def test_dedup_and_order_kept(self):
+        status, pages = core.classify_links(
+            "https://x.com/a https://x.com/a https://x.com/b"
+        )
+        assert pages == ["https://x.com/a", "https://x.com/b"]
+
+    def test_empty(self):
+        assert core.classify_links("") == ([], [])
+        assert core.classify_links(None) == ([], [])
+
+    def test_normalises_www_and_twitter(self):
+        status, pages = core.classify_links(
+            "https://www.twitter.com/user/status/7 and https://mobile.x.com/other"
+        )
+        assert status == ["https://x.com/user/status/7"]
+        assert pages == ["https://x.com/other"]

@@ -1,14 +1,18 @@
-"""XVidGrab Desktop - search-page collector (Edge automation).
+"""XVidGrab Desktop - page collector (Edge automation fallback).
 
-Paste an X (Twitter) search link (x.com/search?q=...) and the app opens the
-page in a real Edge window, auto-scrolls it to the very end collecting every
-video post along the way, then resolves each collected post through the
-public syndication engine so it lands in the normal download list.
+Paste ANY x.com link and the app opens the page in a real Edge window,
+auto-scrolls it to the very end collecting every video post along the way,
+then resolves each collected post through the public syndication engine so
+it lands in the normal download list. Profile timelines, /media tabs,
+search results, hashtag and explore pages all work; the primary (Qt) build
+collects inside the app's own browser window instead and additionally
+supports DM chat links, which need the authenticated in-app session.
 
-Why a browser: X requires a logged-in session for search results and has no
-public search API, so the page itself is the only reliable data source. The
-collector runs in its own persistent Edge profile (~/XVidGrab-EdgeProfile)
-- log in once when asked and every later run reuses that session.
+Why a browser: X requires a logged-in session for timelines and search and
+has no public timeline API, so the page itself is the only reliable data
+source. The collector runs in its own persistent Edge profile
+(~/XVidGrab-EdgeProfile) - log in once when asked and every later run
+reuses that session.
 
 The DOM harvesting is the desktop port of the XVidGrab browser-extension
 v1.2.0 search fix: search-page videos do NOT autoplay (the videoPlayer
@@ -29,16 +33,21 @@ import re
 import shutil
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 import xgrab_core as core
 
 __all__ = [
     "is_search_url",
+    "is_chat_url",
+    "page_kind",
     "SearchCollector",
     "resolve_ids",
     "COLLECT_JS",
     "STATE_JS",
+    "DM_SCROLL_JS",
+    "CHAT_GRACE_SECONDS",
 ]
 
 # x.com/search?q=...  |  x.com/i/search/...  |  x.com/hashtag/...
@@ -57,6 +66,11 @@ LOGIN_WAIT_SECONDS = 10 * 60    # wait up to 10 min for the user to log in
 RESOLVE_DELAY = 0.2             # pause between syndication lookups
 RESOLVE_BACKOFF = 5.0           # extra pause when X starts rate-limiting
 RESOLVE_CHUNK = 10              # videos per on_items callback
+
+# DM chats: once the conversation is open (logged in), start scrolling the
+# history even before a video appears - conversations with no video at the
+# top must still be walked. Grace period (seconds) before starting anyway.
+CHAT_GRACE_SECONDS = 12.0
 
 # Persistent automation profile - log in once, reused by every later run.
 PROFILE_DIR = os.path.join(os.path.expanduser("~"), "XVidGrab-EdgeProfile")
@@ -78,6 +92,29 @@ def is_search_url(text: str) -> str | None:
     if len(path) > 3 and path[:3].lower() == "/i/":
         path = path[2:]
     return f"https://x.com{path}"
+
+
+def is_chat_url(url: str) -> bool:
+    """True when *url* is an X DM conversation (x.com/i/chat/... or /messages).
+
+    DM pages need the logged-in in-app session and a different harvest
+    strategy (videos are recovered from the page's own network traffic,
+    not from tweet articles).
+    """
+    path = urllib.parse.urlsplit(url or "").path.lower()
+    return path.startswith("/i/chat") or path == "/messages"
+
+
+def page_kind(url: str) -> str:
+    """Label for a page URL: 'chat', 'search', 'profile' or 'page'."""
+    if is_chat_url(url):
+        return "chat"
+    if is_search_url(url):
+        return "search"
+    path = urllib.parse.urlsplit(url or "").path.strip("/")
+    if path and "/" not in path:
+        return "profile"
+    return "page"
 
 
 # --------------------------------------------------------------------------
@@ -138,12 +175,46 @@ return JSON.stringify({ n: out.length, h: h, login: login, items: out });
 # Quick page-state probe used while waiting for login / first results.
 STATE_JS = r"""
 var arts = document.querySelectorAll("article[data-testid='tweet']").length;
+var vids = document.querySelectorAll("video").length;
 var login = !!document.querySelector(
   "a[data-testid='loginButton'], input[autocomplete='username']");
 var h = document.scrollingElement
   ? document.scrollingElement.scrollHeight
   : document.documentElement.scrollHeight;
-return JSON.stringify({ articles: arts, login: login, h: h });
+return JSON.stringify({ articles: arts, videos: vids, login: login, h: h });
+"""
+
+# DM conversation probe: walks the message history UP (older messages load
+# on the way back), nudges every mounted video to play so its real CDN URL
+# is requested (the network capture records it - DM videos have no tweet
+# ids, so traffic is the only data source), and reports the scroll position
+# so the Python side can tell when the history top is reached.
+DM_SCROLL_JS = r"""
+var clicked = 0;
+var vids = document.querySelectorAll("video").length;
+document.querySelectorAll("video").forEach(function(v){
+  try { v.muted = true; if (v.paused) { v.play().catch(function(){}); } clicked++; }
+  catch(e) {}
+});
+document.querySelectorAll(
+  "[data-testid='videoComponent'],[data-testid='videoPlayer'],"
+  + "[aria-label*='video' i]"
+).forEach(function(t){ try { t.click(); clicked++; } catch(e) {} });
+var best = null, bestDiff = 0;
+document.querySelectorAll("div").forEach(function(d){
+  var diff = d.scrollHeight - d.clientHeight;
+  if (diff > bestDiff && d.clientHeight > 150){ bestDiff = diff; best = d; }
+});
+var h = 0, top = 0;
+if (best) {
+  h = best.scrollHeight; top = best.scrollTop;
+  best.scrollTop = Math.max(0, best.scrollTop - 700);
+} else {
+  window.scrollBy(0, -700);
+  h = document.scrollingElement ? document.scrollingElement.scrollHeight : 0;
+  top = window.scrollY;
+}
+return JSON.stringify({ v: vids, clicked: clicked, h: h, top: top });
 """
 
 
@@ -153,6 +224,7 @@ def resolve_ids(
     on_items=None,
     stop_event: threading.Event | None = None,
     resolve_fallback=None,
+    on_counts=None,
 ) -> list[core.VideoItem]:
     """Turn collected tweet ids into VideoItems via the syndication engine.
 
@@ -170,6 +242,9 @@ def resolve_ids(
     see. Search results are exactly where this matters most: the scroll
     collector can find a post whose video only a logged-in session can
     reach.
+
+    *on_counts*, if given, is called once with ``(ok, failed)`` link counts
+    after the batch finishes, so callers can show a per-link summary.
     """
     progress = progress or (lambda msg: None)
     on_items = on_items or (lambda chunk: None)
@@ -196,10 +271,15 @@ def resolve_ids(
     # the same URL pattern fetch_videos() parses (the username segment is
     # discarded, only the numeric id is used).
     urls = [f"https://x.com/i/status/{tid}" for tid in ids]
-    core.fetch_videos_batch(
+    ok, failed = core.fetch_videos_batch(
         urls, on_item=_on_item, on_error=_on_error, stop_event=stop_event,
         resolve_fallback=resolve_fallback,
     )
+    if on_counts:
+        try:
+            on_counts(ok, failed)
+        except Exception:
+            pass
     if chunk:
         on_items(list(chunk))
     progress(f"Done - {len(items)} videos ready for download")
@@ -207,12 +287,12 @@ def resolve_ids(
 
 
 class SearchCollector:
-    """Open an X search page in Edge, scroll it to the end, resolve videos.
+    """Open ANY x.com page in Edge, scroll it to the end, resolve videos.
 
     Parameters
     ----------
     url:
-        Canonical search URL (see :func:`is_search_url`).
+        Canonical page URL (search, profile timeline, /media, ...).
     progress:
         ``callable(str)`` - live status lines ("Scrolling... 42 videos").
     on_items:
@@ -255,8 +335,8 @@ class SearchCollector:
             return
         raise core.XGrabError(
             "Microsoft Edge was not found.\n"
-            "Search-page fetching opens Edge to load the results - install "
-            "Edge (microsoft.com/edge) and try again."
+            "Page fetching opens Edge to load the page - install Edge "
+            "(microsoft.com/edge) and try again."
         )
 
     def _create_driver(self):
@@ -353,20 +433,20 @@ class SearchCollector:
         """Run the full collection.  Raises XGrabError on hard failures."""
         driver = None
         try:
-            self.progress("Opening the search page in Edge...")
+            self.progress("Opening the page in Edge...")
             driver = self._create_driver()
             try:
                 driver.get(self.url)
             except Exception as exc:
                 raise core.XGrabError(
-                    f"The search page did not load: {exc}"
+                    f"The page did not load: {exc}"
                 ) from exc
 
             if not self._wait_for_results(driver):
                 if self.stop_event.is_set():
                     return self._resolve_all()
                 raise core.XGrabError(
-                    "No search results appeared in Edge.\n"
+                    "No posts appeared in Edge.\n"
                     "Log in to X in the Edge window when it asks, then "
                     "press Fetch videos again."
                 )
@@ -435,7 +515,7 @@ class SearchCollector:
                         return []
                     raise core.XGrabError(
                         "Scrolled the whole page but found no video posts.\n"
-                        "The search results may contain no videos."
+                        "The page may contain no videos."
                     )
                 # resolving already overlapped with scrolling above - wait
                 # for the in-flight work, then catch any stragglers

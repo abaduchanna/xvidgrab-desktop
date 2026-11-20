@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""XVidGrab Desktop - Tkinter GUI.
+"""XVidGrab Desktop - Tkinter GUI (lightweight build).
 
-Paste an X (Twitter) post link, see every video on the page with
-thumbnails, pick the ones you want (or Select All) and download them at
-the highest available resolution. List view and grid view included.
+Paste ANY x.com link - a post, a whole profile, /media, a search page -
+see every video on that page with thumbnails, pick the ones you want (or
+Select All) and download them at the highest available resolution. List
+view and grid view included; a 'Multiple pages' window adds several links
+at once, joining the already-running fetch.
 
 Run:  python xvidgrab_desktop.py
 
@@ -100,14 +102,28 @@ class App(tk.Tk):
         self.msg_q: "queue.Queue[tuple]" = queue.Queue()
         self.cancel_event = threading.Event()
         self.fetch_stop = threading.Event()
-        self.search_running = False
         self.fetching = False
         self.downloading = False
         self._dl_done = 0
         self._dl_total = 0
         self._dl_ok = 0
         self._dl_fail = 0
-        self._last_urls: list[str] = []
+
+        # fetch-session engine state (unified resolver + page worker)
+        self._session_open = False
+        self._session_sources = 0        # page links not yet collected
+        self._session_total = 0          # all sources of this session
+        self._page_queue: list[str] = []
+        self._page_lock = threading.Lock()
+        self.id_queue: "queue.Queue | None" = None
+        self._resolve_thread = None
+        self._resolve_thread_queue = None
+        self._page_thread = None
+        self._seen_ids: set[str] = set()
+        self._ids_ok = 0
+        self._ids_fail = 0
+        self._multi_dlg = None
+        self._thumb_requested: set = set()
 
         self._build()
         self.after(80, self._poll_queue)
@@ -131,7 +147,7 @@ class App(tk.Tk):
         ).pack(anchor=W)
         tk.Label(
             hleft,
-            text="Paste an X post link - or a search link (x.com/search?q=...) to grab every video on the page",
+            text="Paste ANY x.com link - post, profile, /media or search - every video on that page is fetched",
             bg=BG, fg=MUTED, font=("Segoe UI", 9),
         ).pack(anchor=W)
         tk.Label(
@@ -156,6 +172,7 @@ class App(tk.Tk):
         )
         self.url_entry.bind("<FocusIn>", self._url_focus_in)
         self.url_entry.bind("<Return>", lambda e: self.start_fetch())
+        self._btn(urlrow, "Multiple pages", self.open_multi_dialog).pack(side=LEFT, padx=(0, 8))
         self.fetch_btn = self._btn(urlrow, "Fetch videos", self.start_fetch, primary=True)
         self.fetch_btn.pack(side=LEFT)
 
@@ -216,9 +233,10 @@ class App(tk.Tk):
 
         self.empty_lbl = tk.Label(
             self.inner,
-            text="\n\nPaste an X post link above and press Fetch videos\n\n"
-                 "Every video on that page shows up here with a thumbnail\n\n"
-                 "Multiple links in one paste are fine too",
+            text="\n\nPaste any x.com link above and press Fetch videos\n\n"
+                 "A single post, a whole profile, /media or a search page -\n"
+                 "every video on that page shows up here with a thumbnail\n\n"
+                 "Use 'Multiple pages' to add many links at once",
             bg=BG, fg=MUTED, font=("Segoe UI", 11),
             justify="center",
         )
@@ -311,56 +329,80 @@ class App(tk.Tk):
             self.canvas.yview_scroll(delta, "units")
 
     # ------------------------------------------------------------- fetch
+    def _expand_input(self, text: str) -> str:
+        """Expand t.co short links so every wrapped link is classifiable."""
+        if core._TCO_RE.search(text):
+            try:
+                return core.expand_tco_links(text)
+            except Exception:
+                return text
+        return text
+
     def start_fetch(self) -> None:
-        # clicking while a fetch/search is running stops it (keeps results
+        # clicking while a fetch session is running stops it (keeps results
         # already found) - a large batch's cooldown-and-retry passes can
         # take a while, so there has to be a way out.
-        if self.search_running or self.fetching:
+        if self._session_open or self.fetching:
             self.fetch_stop.set()
             self.set_status("Stopping - please wait...", AMBER)
             return
         if self.downloading:
             return
         text = self.url_entry.get().strip()
-
-        search_url = xsearch.is_search_url(text)
-        if not search_url and core._TCO_RE.search(text):
-            try:
-                search_url = xsearch.is_search_url(core.expand_tco_links(text))
-            except Exception:
-                search_url = None
-
-        def do_fetch():
-            if search_url:
-                self._do_search_fetch(search_url)
-                return
-            urls = core.parse_status_urls(text)
-            if not urls and core._TCO_RE.search(text):
-                try:
-                    urls = core.parse_status_urls(core.expand_tco_links(text))
-                except Exception:
-                    urls = []
-            if not urls:
-                self.msg_q.put(("fetcherr", "", "No X post link or search link found in the input.\n"
-                                "Paste a link like x.com/user/status/123...\n"
-                                "or a search page like x.com/search?q=videos"))
-                return
-            self._last_urls = urls
-            self.msg_q.put(("fetchstart", "", f"Fetching {len(urls)} link"
-                             f"{'s' if len(urls) > 1 else ''}..."))
-            self.fetch_stop.clear()
-            ok_count, fail_count = core.fetch_videos_batch(
-                urls,
-                on_item=lambda items: self.msg_q.put(("meta", "", items)),
-                on_error=lambda u, msg: self.msg_q.put(
-                    ("fetcherr", u, msg)
-                ),
-                stop_event=self.fetch_stop,
+        status_urls, page_urls = core.classify_links(self._expand_input(text))
+        if not status_urls and not page_urls:
+            messagebox.showwarning(
+                core.APP_NAME,
+                "No x.com link found in the input.\n\n"
+                "Paste ANY x.com link - a post (x.com/user/status/123), a\n"
+                "profile (x.com/Kazimirol2), /media, a search page or a DM\n"
+                "chat link - and every video on that page is fetched.\n\n"
+                "Use 'Multiple pages' to add several links at once.",
+                parent=self,
             )
-            self.msg_q.put(("fetchdone", "", (ok_count, fail_count, len(urls))))
-
+            return
         self.fetching = True
-        # reset previous results
+        self._reset_results()
+        self._start_session(status_urls, page_urls)
+
+    def add_links(self, text: str, reset: bool = False) -> int:
+        """Classify *text* and add its links to the fetch session.
+
+        Called by the Multiple pages window. When a session is already
+        running the new links simply join it - page links queue up behind
+        the current one, post links resolve alongside whatever is running.
+        Returns the number of links accepted.
+        """
+        status_urls, page_urls = core.classify_links(self._expand_input(text))
+        count = len(status_urls) + len(page_urls)
+        if not count:
+            self.set_status("No x.com links found in the pasted text.", AMBER)
+            return 0
+        if reset or not self._session_open:
+            if reset and not self.downloading:
+                self.fetching = True
+                self._reset_results()
+            elif not self._session_open:
+                self.fetching = True
+            self._start_session(status_urls, page_urls)
+        else:
+            # join the already-running fetch list
+            self._session_sources += len(page_urls)
+            self._session_total += count
+            for u in status_urls:
+                m = core._STATUS_RE.search(u)
+                if m and self.id_queue is not None:
+                    self.id_queue.put(m.group(2))
+            with self._page_lock:
+                self._page_queue.extend(page_urls)
+            self.set_status(
+                f"{count} link{'s' if count != 1 else ''} added to the "
+                "running fetch list", ACCENT,
+            )
+        return count
+
+    def _reset_results(self) -> None:
+        """Reset previous results (a fresh fetch from the main input)."""
         self.items = []
         self.item_map = {}
         self.sel_vars = {}
@@ -371,34 +413,198 @@ class App(tk.Tk):
         self._clear_results()
         self._update_counter()
         self.progress.pack_forget()
-        if search_url:
-            self.search_running = True
-            self.fetch_stop.clear()
-            # keep the button alive as a Stop control during collection
-            self.fetch_btn.configure(state="normal", text="Stop")
-            self.set_status("Collecting every video from the search page...", MUTED)
-        else:
-            self.fetch_btn.configure(state="disabled", text="Fetching...")
-            self.set_status("Fetching...", MUTED)
-        threading.Thread(target=do_fetch, daemon=True).start()
 
-    def _do_search_fetch(self, search_url: str) -> None:
-        """Worker: scroll the search page in Edge and resolve every video."""
-        try:
-            collector = xsearch.SearchCollector(
-                search_url,
-                progress=lambda msg: self.msg_q.put(("fetchstart", "", msg)),
-                on_items=lambda chunk: self.msg_q.put(("meta", search_url, chunk)),
-                stop_event=self.fetch_stop,
+    # ------------------------------------------------------ fetch session
+    def _start_session(self, status_urls: list, page_urls: list) -> None:
+        """Open a fetch session: one resolver worker + one page worker.
+
+        Post links resolve through the public syndication endpoint; page
+        links (profiles, /media, searches) open in Edge one after another,
+        each joining the same session queue.
+        """
+        self.fetch_stop.clear()
+        self._session_open = True
+        self._session_sources = len(page_urls)
+        self._session_total = len(status_urls) + len(page_urls)
+        self._ids_ok = 0
+        self._ids_fail = 0
+        self._seen_ids = set()
+        self.id_queue = queue.Queue()
+        # if a previous session's resolver thread is still unwinding, tell
+        # it to stop now (its sentinel) so it never lingers spinning
+        if (
+            self._resolve_thread is not None
+            and self._resolve_thread.is_alive()
+            and isinstance(self._resolve_thread_queue, queue.Queue)
+        ):
+            try:
+                self._resolve_thread_queue.put(None)
+            except Exception:
+                pass
+        self._resolve_thread_queue = self.id_queue
+
+        self.fetch_btn.configure(state="normal", text="Stop")
+        if status_urls:
+            self.set_status(
+                f"Fetching {self._session_total} "
+                f"link{'s' if self._session_total != 1 else ''}...", MUTED
             )
-            collector.collect()
-        except core.XGrabError as exc:
-            self.msg_q.put(("fetcherr", search_url, str(exc)))
-        except Exception as exc:  # defensive
-            self.msg_q.put(("fetcherr", search_url, f"Unexpected error: {exc}"))
-        finally:
-            self.search_running = False
-            self.msg_q.put(("fetchdone", "", ""))
+            for u in status_urls:
+                m = core._STATUS_RE.search(u)
+                if m:
+                    self.id_queue.put(m.group(2))
+        self._resolve_thread = threading.Thread(
+            target=self._resolve_worker_loop, args=(self.id_queue,),
+            daemon=True,
+        )
+        self._resolve_thread.start()
+        self._page_thread = threading.Thread(
+            target=self._page_worker_loop, daemon=True
+        )
+        self._page_thread.start()
+
+    def _resolve_worker_loop(self, id_queue: "queue.Queue") -> None:
+        """Drain tweet ids off *id_queue* and resolve them as they arrive.
+
+        Exits when a ``None`` sentinel arrives (pushed by
+        _maybe_finish_session once every source is done) and the queue is
+        drained. Counts land in self._ids_ok/_ids_fail for the summary.
+        """
+        done = False
+        while True:
+            batch: list[str] = []
+            try:
+                item = id_queue.get(timeout=0.5)
+            except queue.Empty:
+                item = "__timeout__"
+            if item is None:
+                done = True
+            elif item != "__timeout__":
+                batch.append(item)
+            while True:
+                try:
+                    nxt = id_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    done = True
+                else:
+                    batch.append(nxt)
+            batch = [tid for tid in batch if tid not in self._seen_ids]
+            if batch:
+                self._seen_ids.update(batch)
+                try:
+                    xsearch.resolve_ids(
+                        batch,
+                        progress=lambda m: self.msg_q.put(("fetchstart", "", m)),
+                        on_items=lambda chunk: self.msg_q.put(("meta", "", chunk)),
+                        stop_event=self.fetch_stop,
+                    )
+                except Exception as exc:  # defensive
+                    self.msg_q.put(("fetcherr", "", f"Unexpected error: {exc}"))
+            if done and id_queue.empty():
+                break
+        if self.id_queue is id_queue:
+            self._session_open = False
+            self.fetching = False
+            self.msg_q.put(("fetchdone", "", None))
+
+    def _page_worker_loop(self) -> None:
+        """Collect page links (Edge) one after another for this session."""
+        while True:
+            if self.fetch_stop.is_set():
+                self._page_queue.clear()
+                self._session_sources = 0
+                self._maybe_finish_session()
+                break
+            url = ""
+            with self._page_lock:
+                if self._page_queue:
+                    url = self._page_queue.pop(0)
+            if not url:
+                if not self._session_open:
+                    break
+                self._maybe_finish_session()
+                time.sleep(0.3)
+                continue
+            try:
+                collector = xsearch.SearchCollector(
+                    url,
+                    progress=lambda m: self.msg_q.put(("fetchstart", "", m)),
+                    on_items=lambda chunk: self.msg_q.put(("meta", url, chunk)),
+                    stop_event=self.fetch_stop,
+                )
+                collector.collect()
+            except core.XGrabError as exc:
+                self.msg_q.put(("fetcherr", url, str(exc)))
+            except Exception as exc:  # defensive
+                self.msg_q.put(("fetcherr", url, f"Unexpected error: {exc}"))
+            finally:
+                self._source_closed()
+
+    def _source_closed(self, *_args) -> None:
+        self._session_sources = max(0, self._session_sources - 1)
+        self._maybe_finish_session()
+
+    def _maybe_finish_session(self) -> None:
+        """End the session once every source is closed and drained."""
+        if not self._session_open:
+            return
+        with self._page_lock:
+            pending_pages = len(self._page_queue)
+        if (
+            self._session_sources == 0
+            and pending_pages == 0
+            and self.id_queue is not None
+            and self.id_queue.empty()
+        ):
+            try:
+                self.id_queue.put(None)  # resolver sentinel
+            except Exception:
+                pass
+
+    # --------------------------------------------------- multiple pages
+    def open_multi_dialog(self) -> None:
+        """Open (or raise) the 'Multiple pages' paste window."""
+        if self._multi_dlg is not None and self._multi_dlg.winfo_exists():
+            self._multi_dlg.deiconify()
+            self._multi_dlg.lift()
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"{core.APP_NAME} - Multiple pages")
+        dlg.geometry("640x480")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        tk.Label(
+            dlg,
+            text="One link per line - ANY x.com link works:\n"
+                 "post links, profiles (x.com/Kazimirol2), /media, search\n"
+                 "pages or just @username. Press 'Add to fetch list' and\n"
+                 "they join the already-running fetch.",
+            bg=BG, fg=MUTED, font=("Segoe UI", 9), justify="left",
+        ).pack(fill=X, padx=14, pady=(12, 6))
+        txt = tk.Text(
+            dlg, bg=SURFACE, fg=TEXT, insertbackground=TEXT, relief="flat",
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT, font=("Segoe UI", 10), height=14,
+        )
+        txt.pack(fill=BOTH, expand=True, padx=14, pady=6)
+        btnrow = tk.Frame(dlg, bg=BG)
+        btnrow.pack(fill=X, padx=14, pady=(4, 12))
+        self._btn(
+            btnrow, "Add to fetch list",
+            lambda: self._multi_submit(dlg, txt), primary=True,
+        ).pack(side=RIGHT)
+        self._btn(btnrow, "Close", dlg.destroy).pack(side=RIGHT, padx=(0, 8))
+        self._multi_dlg = dlg
+
+    def _multi_submit(self, dlg, txt) -> None:
+        text = txt.get("1.0", "end").strip()
+        if not text:
+            return
+        added = self.add_links(text)
+        if added:
+            txt.delete("1.0", "end")
 
     # ------------------------------------------------------------ results
     def _clear_results(self):
@@ -592,7 +798,10 @@ class App(tk.Tk):
             except Exception:
                 pass  # placeholder stays
 
-        pending = [it for it in self.items if it.key not in self._thumb_requested]
+        pending = [
+            it for it in self.items
+            if it.key not in self._thumb_requested and it.thumbnail_url
+        ]
         if not pending:
             return
         pool = ThreadPoolExecutor(max_workers=THUMB_POOL)
@@ -751,31 +960,35 @@ class App(tk.Tk):
                     else:
                         short = url if len(url) < 40 else url[:37] + "..."
                         self.set_status(f"{short}: {err}", RED)
-                        if not self.items:
+                        # modal warning only when nothing is running at all
+                        # and nothing was found - per-link failures during a
+                        # multi-link run stay in the status line
+                        if not self.items and not self._session_open:
                             messagebox.showwarning(core.APP_NAME, err, parent=self)
                 elif kind == "fetchdone":
                     self.fetching = False
-                    self.search_running = False
                     self.fetch_btn.configure(state="normal", text="Fetch videos")
-                    ok_links, fail_links, total_links = msg[2] if msg[2] else (0, 0, 0)
+                    fail_links = self._ids_fail
                     if self.items:
                         self._refresh_results_ui()
                         summary = (
                             f"{len(self.items)} video"
                             f"{'s' if len(self.items) != 1 else ''} found"
                         )
-                        if total_links:
+                        if self._session_total:
                             summary += (
-                                f" from {ok_links}/{total_links} link"
-                                f"{'s' if total_links != 1 else ''}"
+                                f" from {self._session_total} link"
+                                f"{'s' if self._session_total != 1 else ''}"
                             )
-                            if fail_links:
-                                summary += (
-                                    f" ({fail_links} link"
-                                    f"{'s' if fail_links != 1 else ''} failed - see above)"
-                                )
+                        if fail_links:
+                            summary += (
+                                f" ({fail_links} link"
+                                f"{'s' if fail_links != 1 else ''} failed - see above)"
+                            )
                         summary += " - pick and press Download selected"
                         self.set_status(summary, GREEN if not fail_links else AMBER)
+                    else:
+                        self.set_status("No videos found in the fetched links.", AMBER)
                 elif kind == "thumb":
                     _, key, data = msg
                     try:

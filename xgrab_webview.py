@@ -31,10 +31,13 @@ import xgrab_search as xsearch
 __all__ = [
     "webengine_available",
     "run_search_dialog",
+    "run_page_dialog_async",
     "clean_user_agent",
     "parse_harvest",
     "merge_harvest",
     "resolve_via_authenticated_browser",
+    "fetch_bytes_via_browser",
+    "build_dm_items",
     "shutdown_resolve_view",
     "WEBVIEW_PROFILE_DIR",
 ]
@@ -101,6 +104,67 @@ def merge_harvest(found: dict, payload: dict) -> tuple[int, int]:
                 "text": rec.get("text") or "",
             }
     return int(payload.get("n") or 0), int(payload.get("h") or 0)
+
+
+# DM video URLs group by their shared path prefix: the variant segment
+# (codec + resolution + filename) differs per rendition of ONE video.
+_DM_VARIANT_RE = re.compile(
+    r"^(.*?/)(?:vid(?:eo)?/[^/]+/\d+x\d+/[^/?]+|[^/?]+\.mp4(?:\?.*)?)$"
+)
+
+
+def build_dm_items(urls: list, posters=None) -> list:
+    """Turn video CDN URLs captured from a DM chat into VideoItems.
+
+    One item per video (all captured renditions grouped as its formats),
+    best resolution first. Posters, when captured, are attached in order
+    so the list shows real thumbnails instead of placeholders. Pure helper
+    (no Qt needed) - used by the GUI when a chat collection finishes.
+    """
+    posters = [p for p in (posters or []) if p]
+    groups: dict = {}
+    order: list = []
+    for u in urls:
+        if not (u.endswith(".mp4") or ".mp4?" in u):
+            continue  # m3u8 playlists have no direct MP4 use here
+        m = _DM_VARIANT_RE.match(u)
+        key = m.group(1) if m else u
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(u)
+    items: list = []
+    for i, key in enumerate(order, start=1):
+        fmts = []
+        for u in groups[key]:
+            w, h = core._dims_from_url(u)
+            fmts.append(
+                core.VideoFormat(
+                    content_type="video/mp4",
+                    width=w,
+                    height=h,
+                    bitrate=0,
+                    url=u,
+                )
+            )
+        fmts.sort(key=lambda f: (f.height * f.width), reverse=True)
+        if not fmts:
+            continue
+        items.append(
+            core.VideoItem(
+                tweet_id=f"dm-{i}",
+                index=i,
+                total=len(order),
+                uploader="dm",
+                text="",
+                duration_ms=None,
+                media_type="video",
+                thumbnail_url=posters[i - 1] if i <= len(posters) else "",
+                formats=fmts,
+                webpage_url="",
+            )
+        )
+    return items
 
 
 def webengine_available() -> bool:
@@ -199,6 +263,16 @@ if _QT_OK:
     _VIDEO_CDN_RE = re.compile(
         r"https://video\.twimg\.com/[^\s\"']+\.(?:mp4|m3u8)(?:\?[^\s\"']*)?"
     )
+    # Video poster/thumbnail images (pbs.twimg.com *video_thumb* paths) -
+    # recorded so items recovered through the authenticated browser still
+    # get a real thumbnail instead of a blank placeholder.
+    _POSTER_CDN_RE = re.compile(
+        r"https://pbs\.twimg\.com/[^\s\"']*"
+        r"(?:ext_tw_video_thumb|amplify_video_thumb|tweet_video_thumb|"
+        r"dm_video_thumb|ext_tw_dm_video_thumb|video_thumb)"
+        r"[^\s\"']*\.(?:jpg|png|webp)(?:\?[^\s\"']*)?",
+        re.IGNORECASE,
+    )
 
     # How long the gate/thumbnail click-through polls for, and how often -
     # X's React hydration time varies with network/render speed, so this
@@ -208,34 +282,48 @@ if _QT_OK:
     RESOLVE_SETTLE_MS = 6500              # Python-side wait >= the JS retry window
 
     class _VideoCaptureInterceptor(QWebEngineUrlRequestInterceptor):
-        """Watches every request on the shared profile, but only records
-        the ones whose originating page is the one resolve just navigated
-        to - a search dialog's own scroll traffic on the same shared
-        profile passes through untouched and unrecorded, since its
-        requests carry a different firstPartyUrl.
+        """Watches every request on the shared profile. Two modes:
 
-        Matched by tweet id being present in firstPartyUrl, NOT an exact
-        URL match: x.com/i/status/<id> (what we navigate to - the only
-        form that works without already knowing the author's handle)
-        redirects to the canonical x.com/<user>/status/<id> once it
-        resolves, so the page's real, final URL never equals the one we
-        set. An exact match would silently record nothing, ever, even
-        on a page that loaded and played the video correctly."""
+        - target mode (resolve_via_authenticated_browser): only records
+          requests whose originating page contains the tweet id being
+          resolved. x.com/i/status/<id> (what we navigate to) redirects to
+          the canonical x.com/<user>/status/<id>, so matching by id-in-url
+          is the only reliable scope - an exact URL match would record
+          nothing, ever.
+        - capture-all mode (DM chat collection): records every video CDN
+          request from any page while the chat collector is open. DM
+          messages have no tweet articles or ids at all, so the page's own
+          network traffic is the only data source.
+
+        Both modes also record video poster/thumb URLs so the GUI can show
+        real thumbnails for recovered items.
+        """
 
         def __init__(self) -> None:
             super().__init__()
             self.target_tweet_id = ""
+            self.capture_all = False
             self.found: list[str] = []
+            self.posters: list[str] = []
 
         def interceptRequest(self, info) -> None:  # noqa: N802 - Qt override
             try:
-                if not self.target_tweet_id:
-                    return
-                if self.target_tweet_id not in info.firstPartyUrl().toString():
+                if self.capture_all:
+                    scoped = True
+                elif self.target_tweet_id:
+                    scoped = (
+                        self.target_tweet_id
+                        in info.firstPartyUrl().toString()
+                    )
+                else:
+                    scoped = False
+                if not scoped:
                     return
                 url = info.requestUrl().toString()
                 if _VIDEO_CDN_RE.match(url):
                     self.found.append(url)
+                elif _POSTER_CDN_RE.match(url):
+                    self.posters.append(url)
             except Exception:
                 pass  # must never raise - that can take the page load down with it
 
@@ -248,7 +336,13 @@ if _QT_OK:
             shared_profile().setUrlRequestInterceptor(_capture_interceptor)
         return _capture_interceptor
 
-    def _video_items_from_urls(tweet_id: str, urls: list[str]) -> list:
+    def _video_items_from_urls(
+        tweet_id: str,
+        urls: list[str],
+        poster: str = "",
+        uploader: str = "x",
+        webpage_url: str = "",
+    ) -> list:
         mp4s = [u for u in urls if u.endswith(".mp4") or ".mp4?" in u]
         fmts = []
         for u in mp4s:
@@ -273,13 +367,13 @@ if _QT_OK:
                 tweet_id=tweet_id,
                 index=1,
                 total=1,
-                uploader="x",
+                uploader=uploader,
                 text="",
                 duration_ms=None,
                 media_type="video",
-                thumbnail_url="",
+                thumbnail_url=poster or "",
                 formats=fmts,
-                webpage_url=f"https://x.com/i/status/{tweet_id}",
+                webpage_url=webpage_url or f"https://x.com/i/status/{tweet_id}",
             )
         ]
 
@@ -410,6 +504,7 @@ if _QT_OK:
         url = f"https://x.com/i/status/{tweet_id}"
         interceptor.target_tweet_id = tweet_id
         interceptor.found = []
+        interceptor.posters = []
 
         state = {"loaded": False}
         loop = QEventLoop()
@@ -499,7 +594,15 @@ if _QT_OK:
         # for the next resolve - shutdown_resolve_view() tears it down for
         # real, once, at app exit (see its docstring for why).
         urls = list(dict.fromkeys(interceptor.found))  # de-dup, keep order
-        items = _video_items_from_urls(tweet_id, urls) if state["loaded"] else []
+        poster = next(iter(dict.fromkeys(interceptor.posters)), "")
+        items = (
+            _video_items_from_urls(
+                tweet_id, urls, poster=poster,
+                webpage_url=f"https://x.com/i/status/{tweet_id}",
+            )
+            if state["loaded"]
+            else []
+        )
         if not items:
             _dump_resolve_debug(page, tweet_id, state["loaded"], urls)
         view.hide()  # closed between resolves - see the .show() note above
@@ -507,14 +610,107 @@ if _QT_OK:
             return None
         return items
 
-    class SearchWebViewDialog(QDialog):
-        """In-app browser window: load, log in (here!), scroll, harvest."""
+    def fetch_bytes_via_browser(url: str, timeout: float = 12.0) -> bytes | None:
+        """Fetch *url*'s bytes through the embedded browser session.
 
-        def __init__(self, parent, url: str, stop_event=None, on_new_ids=None) -> None:
+        Thumbnail fallback for machines where the direct (Python) request
+        to pbs.twimg.com fails - VPN/proxy setups where the browser's
+        network stack works but plain urllib does not. Navigates the shared
+        off-screen page to the image and reads it back via a same-origin
+        canvas (navigated-to images are same-origin to their own document,
+        so the canvas is not tainted and toDataURL succeeds).
+
+        MUST be called from the GUI thread (QtWebEngine requirement); worker
+        threads reach it through the same blocking-queued-connection bridge
+        as the authenticated resolve. Returns image bytes, or None.
+        """
+        if not _QT_OK:
+            return None
+        try:
+            view, page = _ensure_resolve_view()
+            view.show()
+            state = {"loaded": False}
+            loop = QEventLoop()
+
+            def on_load(ok) -> None:
+                state["loaded"] = True
+                loop.quit()
+
+            page.loadFinished.connect(on_load)
+            page.setUrl(QUrl(url))
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(loop.quit)
+            timer.start(int(timeout * 1000))
+            loop.exec()
+            timer.stop()
+            try:
+                page.loadFinished.disconnect(on_load)
+            except Exception:
+                pass
+            if not state["loaded"]:
+                view.hide()
+                return None
+
+            result = {"data": ""}
+            grab_loop = QEventLoop()
+
+            def on_canvas(value) -> None:
+                result["data"] = value if isinstance(value, str) else ""
+                grab_loop.quit()
+
+            page.runJavaScript(
+                "(function(){"
+                "  var img = document.querySelector('img');"
+                "  if (!img) { return ''; }"
+                "  var c = document.createElement('canvas');"
+                "  c.width = img.naturalWidth; c.height = img.naturalHeight;"
+                "  c.getContext('2d').drawImage(img, 0, 0);"
+                "  return c.toDataURL('image/png');"
+                "})()",
+                on_canvas,
+            )
+            grab_timer = QTimer()
+            grab_timer.setSingleShot(True)
+            grab_timer.timeout.connect(grab_loop.quit)
+            grab_timer.start(8000)
+            grab_loop.exec()
+            grab_timer.stop()
+
+            view.hide()
+            data = result["data"]
+            if not data.startswith("data:image"):
+                return None
+            import base64
+
+            return base64.b64decode(data.split(",", 1)[1])
+        except Exception:
+            try:
+                view.hide()
+            except Exception:
+                pass
+            return None
+
+    class SearchWebViewDialog(QDialog):
+        """In-app browser window: load, log in (here!), scroll, harvest.
+
+        Works for ANY x.com page - search results, profile timelines,
+        /media tabs, lists, bookmarks - and, in a special chat mode, DM
+        conversations (x.com/i/chat/...), whose videos carry no tweet ids
+        and are recovered from the page's own network traffic instead.
+        """
+
+        def __init__(
+            self, parent, url: str, stop_event=None, on_new_ids=None,
+            modal: bool = True,
+        ) -> None:
             super().__init__(parent)
-            self.setWindowTitle(f"{core.APP_NAME} - Search")
+            self.kind = xsearch.page_kind(url)  # chat | search | profile | page
+            self.setWindowTitle(
+                f"{core.APP_NAME} - {self.kind.capitalize()}"
+            )
             self.resize(1120, 800)
-            self.setModal(True)
+            self.setModal(modal)
             self.stop_event = stop_event or threading.Event()
             self.search_url = url
             # called with a list of newly-found tweet ids after every scroll
@@ -526,12 +722,16 @@ if _QT_OK:
             self.found: dict[str, dict] = {}
             self.stopped = False
             self.error: str | None = None
-            self._phase = "loading"          # loading -> scrolling -> done
+            # DM chat capture (kind == "chat" only)
+            self.dm_urls: list[str] = []
+            self.dm_posters: list[str] = []
+            self._phase = "loading"          # loading -> scrolling/chat -> done
             self._told_login = False
             self._login_reloads = 0
             self._load_deadline = (
                 time.monotonic() + xsearch.LOGIN_WAIT_SECONDS
             )
+            self._page_opened = time.monotonic()
             self._scroll_started = 0.0
             self._last_h = -1
             self._last_count = -1
@@ -555,7 +755,7 @@ if _QT_OK:
             lay.setSpacing(6)
 
             head = QHBoxLayout()
-            self.status_lbl = QLabel("Loading the search page inside the app...")
+            self.status_lbl = QLabel("Loading the page inside the app...")
             head.addWidget(self.status_lbl, 1)
             self.stop_btn = QPushButton("Stop collecting")
             self.stop_btn.clicked.connect(self._stop)
@@ -640,11 +840,18 @@ if _QT_OK:
                 return
             if self._phase == "loading":
                 if time.monotonic() > self._load_deadline:
-                    self.error = (
-                        "No search results appeared.\n"
-                        "If the window asked you to log in, finish logging in "
-                        "and press Fetch videos again."
-                    )
+                    if self.kind == "chat":
+                        self.error = (
+                            "The chat did not load.\n"
+                            "Log in to X in this window when asked, then "
+                            "press Fetch videos again."
+                        )
+                    else:
+                        self.error = (
+                            "No posts appeared on the page.\n"
+                            "If the window asked you to log in, finish "
+                            "logging in and press Fetch videos again."
+                        )
                     self._finish()
                     return
                 self.page.runJavaScript(iife(xsearch.STATE_JS), self._on_state)
@@ -657,6 +864,25 @@ if _QT_OK:
                     self._finish()
                     return
                 self.page.runJavaScript(iife(xsearch.COLLECT_JS), self._on_collect)
+            elif self._phase == "chat":
+                if (
+                    time.monotonic() - self._scroll_started
+                    > xsearch.HARD_CAP_SECONDS
+                ):
+                    self._set_status("Safety cap reached - using what we have.")
+                    self._finish()
+                    return
+                self.page.runJavaScript(
+                    iife(xsearch.DM_SCROLL_JS), self._on_chat_tick
+                )
+
+        def _is_on_target(self, url: str) -> bool:
+            """True when the browser is still on the page we were asked to
+            collect (same path). Used instead of the old search-only URL
+            check so profiles, /media, chats and every other link work."""
+            cur = QUrl(url).path().rstrip("/")
+            tgt = QUrl(self.search_url).path().rstrip("/")
+            return bool(cur) and cur == tgt
 
         def _on_state(self, raw) -> None:
             if self._closed:
@@ -666,11 +892,31 @@ if _QT_OK:
             arts = int(state.get("articles") or 0)
             login = bool(state.get("login"))
             url = self.view.url().toString()
-            on_search = any(
-                p in url for p in ("/search", "/hashtag", "/explore")
-            )
+            on_target = self._is_on_target(url)
 
-            if arts > 0 and on_search:
+            if self.kind == "chat":
+                # Chats render no tweet articles at all; the conversation
+                # is ready once it shows a video (or, for video-less chats,
+                # after a short grace period). Login first if asked.
+                if login:
+                    if not self._told_login:
+                        self._told_login = True
+                        self.banner.setVisible(True)
+                        self._set_status(
+                            "Log in to see this chat - the collector "
+                            "keeps watching..."
+                        )
+                elif (
+                    int(state.get("videos") or 0) > 0
+                    or time.monotonic() - self._page_opened
+                    > xsearch.CHAT_GRACE_SECONDS
+                ):
+                    self._begin_chat()
+                    return
+                self._timer.start(int(POLL_INTERVAL * 1000))
+                return
+
+            if arts > 0 and on_target:
                 # goal state reached - start the scroll loop
                 self.banner.setVisible(False)
                 self._phase = "scrolling"
@@ -689,10 +935,11 @@ if _QT_OK:
                 self._told_login
                 and not login
                 and arts > 0
-                and not on_search
+                and not on_target
                 and self._login_reloads < MAX_LOGIN_RELOADS
             ):
-                # logged in but X bounced us to Home - come back to the search
+                # logged in but X bounced us elsewhere (usually Home) -
+                # come back to the page we were asked to collect
                 self._login_reloads += 1
                 self.view.load(QUrl(self.search_url))
                 self._timer.start(int(POLL_INTERVAL * 1000))
@@ -740,6 +987,55 @@ if _QT_OK:
                 return
             self._timer.start(int(xsearch.SCROLL_STEP_SLEEP * 1000))
 
+        # -------------------------------------------------------- chat mode
+        def _begin_chat(self) -> None:
+            """DM conversations: switch to the network-capture collector.
+
+            DM videos have no tweet articles or ids, so the videos are
+            recovered from the page's own video CDN requests while every
+            mounted video is nudged to play and the history scrolls up.
+            """
+            self.banner.setVisible(False)
+            self._phase = "chat"
+            self._scroll_started = time.monotonic()
+            try:
+                interceptor = _ensure_interceptor()
+                interceptor.capture_all = True
+                interceptor.found = []
+                interceptor.posters = []
+            except Exception:
+                pass
+            self._set_status("Scrolling the chat - collecting videos...")
+            self._timer.start(300)
+
+        def _on_chat_tick(self, raw) -> None:
+            if self._closed or self._phase != "chat":
+                return
+            self._ping()
+            data = parse_harvest(raw) or {}
+            vids = int(data.get("v") or 0)
+            self._set_status(
+                f"Scrolling the chat... {vids} video"
+                f"{'s' if vids != 1 else ''} on screen"
+            )
+            top = int(data.get("top") or 0)
+            if (
+                top == 0
+                and time.monotonic() - self._scroll_started > 5.0
+            ):
+                self._finish()  # history top reached
+                return
+            if vids == self._last_count and top == self._last_h:
+                self._stable += 1
+            else:
+                self._stable = 0
+            self._last_h = top
+            self._last_count = vids
+            if self._stable >= xsearch.STABLE_ROUNDS:
+                self._finish()
+                return
+            self._timer.start(int(xsearch.SCROLL_STEP_SLEEP * 1000))
+
         # ------------------------------------------------------------ finish
         def _stop(self) -> None:
             self.stop_event.set()
@@ -752,7 +1048,20 @@ if _QT_OK:
             self.stopped = stopped or self.stop_event.is_set()
             self._watchdog.stop()
             self._timer.stop()
-            if self.found and not self.error:
+            if self.kind == "chat":
+                # harvest what the network capture recorded, then stop it
+                try:
+                    interceptor = _ensure_interceptor()
+                    self.dm_urls = list(dict.fromkeys(interceptor.found))
+                    self.dm_posters = list(dict.fromkeys(interceptor.posters))
+                    interceptor.capture_all = False
+                except Exception:
+                    pass
+                if self.dm_urls and not self.error:
+                    self._set_status(
+                        "Chat collected - preparing the download list..."
+                    )
+            elif self.found and not self.error:
                 self._set_status(
                     f"Collected {len(self.found)} video post"
                     f"{'s' if len(self.found) != 1 else ''} - "
@@ -770,7 +1079,20 @@ if _QT_OK:
             # the X button = Stop (keeps whatever was collected so far)
             self.stop_event.set()
             self.stopped = True
-            self._closed = True
+            if not self._closed:
+                # collect the chat capture before the flag flips off
+                if self.kind == "chat":
+                    try:
+                        interceptor = _ensure_interceptor()
+                        self.dm_urls = list(dict.fromkeys(interceptor.found))
+                        self.dm_posters = list(
+                            dict.fromkeys(interceptor.posters)
+                        )
+                        interceptor.capture_all = False
+                    except Exception:
+                        pass
+                else:
+                    self._closed = True
             self._watchdog.stop()
             self._timer.stop()
             super().closeEvent(event)
@@ -778,7 +1100,7 @@ if _QT_OK:
     def run_search_dialog(
         parent, url: str, progress=None, stop_event=None, on_new_ids=None
     ):
-        """Open the in-app search window and return the harvest result.
+        """Open the in-app collection window (modal) and return the result.
 
         Returns ``{"found": {id: {"user","text"}}, "stopped": bool,
         "error": str | None}``.  Blocks (modal) until the page is fully
@@ -800,7 +1122,61 @@ if _QT_OK:
             "found": dict(dlg.found),
             "stopped": bool(dlg.stopped),
             "error": dlg.error,
+            "dm_urls": list(dlg.dm_urls),
+            "dm_posters": list(dlg.dm_posters),
+            "kind": dlg.kind,
         }
+
+    def run_page_dialog_async(
+        parent, url: str, progress=None, stop_event=None, on_new_ids=None,
+        on_done=None,
+    ):
+        """Open the in-app collection window NON-modally and return it.
+
+        Used by the fetch queue: several page links can be waiting, so the
+        window must not block the main UI - the user stays able to add more
+        links while a page is being collected. *on_done* is called (GUI
+        thread, via the dialog's finished signal) with the same result dict
+        :func:`run_search_dialog` returns.
+        """
+        dlg = SearchWebViewDialog(
+            parent, url, stop_event=stop_event, on_new_ids=on_new_ids,
+            modal=False,
+        )
+        if progress:
+            dlg.status_hook = progress
+
+        def _finished(*_args) -> None:
+            try:
+                result = {
+                    "found": dict(dlg.found),
+                    "stopped": bool(dlg.stopped),
+                    "error": dlg.error,
+                    "dm_urls": list(dlg.dm_urls),
+                    "dm_posters": list(dlg.dm_posters),
+                    "kind": dlg.kind,
+                }
+            except Exception:
+                result = {
+                    "found": {}, "stopped": False, "error": None,
+                    "dm_urls": [], "dm_posters": [], "kind": "page",
+                }
+            if on_done:
+                try:
+                    on_done(result)
+                except Exception:
+                    pass
+            # the collection window is done - release it (queued pages open
+            # fresh windows, so a long multi-link run must not pile up
+            # hidden QDialog/WebEngine instances)
+            try:
+                dlg.deleteLater()
+            except Exception:
+                pass
+
+        dlg.finished.connect(_finished)
+        dlg.show()
+        return dlg
 
 else:  # no Qt / no QtWebEngine - keep the module importable anyway
 
@@ -810,7 +1186,16 @@ else:  # no Qt / no QtWebEngine - keep the module importable anyway
             "this build."
         )
 
+    def run_page_dialog_async(*_args, **_kwargs):  # pragma: no cover
+        raise RuntimeError(
+            "The in-app browser (PySide6 QtWebEngine) is not available in "
+            "this build."
+        )
+
     def resolve_via_authenticated_browser(*_args, **_kwargs):  # pragma: no cover
+        return None
+
+    def fetch_bytes_via_browser(*_args, **_kwargs):  # pragma: no cover
         return None
 
     def shutdown_resolve_view(*_args, **_kwargs):  # pragma: no cover
